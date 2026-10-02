@@ -1,7 +1,7 @@
 import React from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { useApi } from '../lib/api.js';
-import { Announcements, Breadcrumb, ForumRow, Pagination, Status, ThreadRow } from '../components/ui.jsx';
+import { Announcements, Breadcrumb, ForumRow, Pagination, Status, ThreadRow, UserList } from '../components/ui.jsx';
 import { formatNumber } from '../lib/format.js';
 
 const SORTS = [
@@ -31,7 +31,7 @@ export default function Forum() {
       {forum.moderators.length > 0 && (
         <p className="page-meta">
           <span className="muted">Quản lý box: </span>
-          {forum.moderators.map((m) => m.username).join(', ')}
+          <UserList users={forum.moderators} />
         </p>
       )}
 

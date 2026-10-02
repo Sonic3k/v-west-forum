@@ -23,7 +23,7 @@ export function getLookups() {
 }
 
 async function build() {
-  const [forumRows, modRows, groupRows, prefixRows, postContentType] = await Promise.all([
+  const [forumRows, modRows, groupRows, prefixRows, fieldRows, postContentType] = await Promise.all([
     q(`SELECT forumid, title, title_clean, description, description_clean, options, displayorder,
               replycount, threadcount, lastpost, lastposter, lastposterid, lastpostid,
               lastthread, lastthreadid, parentid, parentlist, link
@@ -33,6 +33,8 @@ async function build() {
          LEFT JOIN user u ON u.userid = m.userid`),
     q('SELECT usergroupid, title, opentag FROM usergroup'),
     q("SELECT varname, text FROM phrase WHERE varname LIKE 'prefix\\_%\\_title\\_plain' ORDER BY languageid")
+      .catch(() => []),
+    q("SELECT varname, text FROM phrase WHERE varname LIKE 'field%\\_title' ORDER BY languageid")
       .catch(() => []),
     findPostContentType(),
   ]);
@@ -105,7 +107,14 @@ async function build() {
     if (m) prefixes.set(m[1], clean(p.text));
   }
 
-  return { forums, roots, moderators, groups, prefixes, postContentType };
+  // Tên các trường hồ sơ tùy chỉnh (userfield.field1, field2...).
+  const profileFields = new Map();
+  for (const f of fieldRows) {
+    const m = /^(field\d+)_title$/.exec(f.varname);
+    if (m) profileFields.set(m[1], clean(f.text));
+  }
+
+  return { forums, roots, moderators, groups, prefixes, profileFields, postContentType };
 }
 
 async function findPostContentType() {
@@ -128,6 +137,17 @@ async function findPostContentType() {
 function extractColor(opentag) {
   const m = /color\s*[:=]\s*["']?\s*(#[0-9a-fA-F]{3,8}|[a-zA-Z]{3,20})/.exec(opentag || '');
   return m ? m[1] : null;
+}
+
+// Các box một thành viên làm quản lý (forumid = -1 là siêu quản lý).
+export function moderatedBy(lk, userId) {
+  const out = [];
+  for (const [forumId, list] of lk.moderators) {
+    if (!list.some((m) => m.userId === userId)) continue;
+    if (forumId === -1) out.push({ id: -1, title: 'Siêu quản lý toàn diễn đàn' });
+    else if (lk.forums.has(forumId)) out.push({ id: forumId, title: lk.forums.get(forumId).title });
+  }
+  return out;
 }
 
 export function forumSummary(lk, id) {

@@ -1,7 +1,7 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
 import { useApi } from '../lib/api.js';
-import { Announcements, ForumRow, Status } from '../components/ui.jsx';
+import { Announcements, ForumRow, Status, UserList } from '../components/ui.jsx';
 
 export default function Home() {
   const { data, loading, error } = useApi('/api/forums');
@@ -28,7 +28,7 @@ export default function Home() {
       )}
       {data.superModerators.length > 0 && (
         <p className="supermods muted">
-          Siêu quản lý toàn diễn đàn: {data.superModerators.map((m) => m.username).join(', ')}
+          Siêu quản lý toàn diễn đàn: <UserList users={data.superModerators} />
         </p>
       )}
     </main>

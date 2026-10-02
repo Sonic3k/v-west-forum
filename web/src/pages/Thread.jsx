@@ -4,7 +4,7 @@ import { useApi } from '../lib/api.js';
 import { parseBBCode, collectAttachIds } from '../lib/bbcode.js';
 import { formatDate, formatDay, formatNumber, formatSize } from '../lib/format.js';
 import BBCode from '../components/BBCode.jsx';
-import { Breadcrumb, Label, Pagination, Status, UserName } from '../components/ui.jsx';
+import { Breadcrumb, Label, Pagination, Status, UserLink, UserList } from '../components/ui.jsx';
 
 export default function Thread() {
   const { id } = useParams();
@@ -38,7 +38,10 @@ export default function Thread() {
         {thread.title}
       </h1>
       <p className="page-meta">
-        <span>Lập bởi <strong>{thread.starter.username || 'Khách'}</strong>, {formatDate(thread.dateline)}.</span>{' '}
+        <span>
+          Lập bởi <strong><UserLink id={thread.starter.userId} name={thread.starter.username} /></strong>,{' '}
+          {formatDate(thread.dateline)}.
+        </span>{' '}
         <span>{formatNumber(data.total)} bài, {formatNumber(thread.views)} lượt xem.</span>{' '}
         {thread.sticky && <Label tone="pin">Dán</Label>}
         {thread.closed && <Label>Đã khóa</Label>}
@@ -73,7 +76,7 @@ function Post({ post, attachments }) {
       </header>
       <div className="post-grid">
         <aside className="author">
-          <UserName name={author?.username || post.username} color={author?.color} />
+          <UserLink id={author?.id} name={author?.username || post.username} color={author?.color} />
           {author ? (
             <>
               {author.title && <span className="author-title">{author.title}</span>}
@@ -130,7 +133,7 @@ function Thanks({ list }) {
   return (
     <p className="thanks">
       <span className="muted">{formatNumber(list.length)} người cảm ơn: </span>
-      {shown.map((t) => t.username).join(', ')}
+      <UserList users={shown} />
       {!all && list.length > LIMIT && (
         <>
           {' '}
@@ -149,7 +152,7 @@ function Comments({ list }) {
       <h3 className="mini-title">Bình luận ({list.length})</h3>
       {list.map((c) => (
         <div key={c.id} className="comment">
-          <span className="comment-who">{c.username}</span>
+          <UserLink id={c.userId} name={c.username} className="comment-who" />
           <span className="muted comment-when">{formatDate(c.dateline)}</span>
           <BBCode text={c.text} className="bb comment-text" />
         </div>

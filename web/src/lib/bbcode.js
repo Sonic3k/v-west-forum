@@ -139,7 +139,7 @@ export function safeUrl(input) {
   return null;
 }
 
-// Link cũ trỏ về chính diễn đàn (showthread.php, forumdisplay.php) → trang tương ứng trong panel.
+// Link cũ trỏ về chính diễn đàn (showthread.php, forumdisplay.php, member.php) → trang tương ứng trong panel.
 export function internalRoute(href) {
   let url;
   try {
@@ -162,6 +162,10 @@ export function internalRoute(href) {
   if (/forumdisplay\.php$/i.test(url.pathname)) {
     const f = param('f') || leadingId;
     if (f) return `/f/${f}`;
+  }
+  if (/member\.php$/i.test(url.pathname)) {
+    const u = param('u') || leadingId;
+    if (u) return `/u/${u}`;
   }
   return null;
 }

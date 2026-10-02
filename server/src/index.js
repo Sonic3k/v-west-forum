@@ -6,12 +6,20 @@ import { passwordGate } from './passwordGate.js';
 import { forumsRouter } from './routes/forums.js';
 import { threadsRouter, postsRouter } from './routes/threads.js';
 import { attachmentsRouter } from './routes/attachments.js';
+import { usersRouter } from './routes/users.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const webDist = process.env.WEB_DIST || path.resolve(here, '../../web/dist');
 
 const app = express();
 app.disable('x-powered-by');
+
+// Không cho công cụ tìm kiếm lập chỉ mục: panel chứa email, tin nhắn riêng của thành viên cũ.
+app.use((req, res, next) => {
+  res.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
+  next();
+});
+app.get('/robots.txt', (req, res) => res.type('text/plain').send('User-agent: *\nDisallow: /\n'));
 
 // Railway healthcheck: không cần mật khẩu, không cần database.
 app.get('/api/health', (req, res) => res.json({ ok: true }));
@@ -28,6 +36,7 @@ app.use('/api/forums', forumsRouter);
 app.use('/api/threads', threadsRouter);
 app.use('/api/posts', postsRouter);
 app.use('/api/attachments', attachmentsRouter);
+app.use('/api/users', usersRouter);
 app.use('/api', (req, res) => res.status(404).json({ error: 'Không có API này.' }));
 
 app.use('/assets', express.static(path.join(webDist, 'assets'), { immutable: true, maxAge: '1y' }));

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { Link } from 'react-router-dom';
 import BBCode from './BBCode.jsx';
 import { formatDate, formatNumber } from '../lib/format.js';
@@ -27,15 +27,16 @@ export function Breadcrumb({ items = [] }) {
     <nav className="crumbs" aria-label="Vị trí">
       <Link to="/">Trang chủ</Link>
       {items.map((it) => (
-        <React.Fragment key={it.id}>
+        <React.Fragment key={`${it.to || it.id}`}>
           <span className="crumbs-sep" aria-hidden="true">/</span>
-          <Link to={`/f/${it.id}`}>{it.title}</Link>
+          <Link to={it.to || `/f/${it.id}`}>{it.title}</Link>
         </React.Fragment>
       ))}
     </nav>
   );
 }
 
+// Trên điện thoại chỉ hiện trang hiện tại ±1 (các số xa hơn có class "far", ẩn bằng CSS).
 export function Pagination({ page, pages, hrefFor }) {
   if (!pages || pages <= 1) return null;
   const nums = new Set([1, pages]);
@@ -44,27 +45,41 @@ export function Pagination({ page, pages, hrefFor }) {
   const items = [];
   sorted.forEach((n, i) => {
     if (i > 0 && n - sorted[i - 1] > 1) items.push(<span key={`gap${n}`} className="pager-gap">…</span>);
+    const far = Math.abs(n - page) === 2 && n !== 1 && n !== pages ? ' far' : '';
     items.push(
       n === page
         ? <span key={n} className="pager-current" aria-current="page">{n}</span>
-        : <Link key={n} to={hrefFor(n)}>{n}</Link>,
+        : <Link key={n} to={hrefFor(n)} className={`pager-num${far}`}>{n}</Link>,
     );
   });
   return (
     <nav className="pager" aria-label="Phân trang">
-      {page > 1 ? <Link to={hrefFor(page - 1)}>Trang trước</Link> : <span className="pager-off">Trang trước</span>}
+      {page > 1
+        ? <Link to={hrefFor(page - 1)} className="pager-step">Trước</Link>
+        : <span className="pager-step pager-off">Trước</span>}
       <span className="pager-nums">{items}</span>
-      {page < pages ? <Link to={hrefFor(page + 1)}>Trang sau</Link> : <span className="pager-off">Trang sau</span>}
+      {page < pages
+        ? <Link to={hrefFor(page + 1)} className="pager-step">Sau</Link>
+        : <span className="pager-step pager-off">Sau</span>}
     </nav>
   );
 }
 
-export function UserName({ name, color }) {
-  return (
-    <span className="uname" style={color ? { color } : undefined}>
-      {name || 'Khách'}
-    </span>
-  );
+// Tên thành viên có link tới trang thành viên (khách / tài khoản đã xóa thì chỉ hiện chữ).
+export function UserLink({ id, name, color, className = '' }) {
+  const style = color ? { color } : undefined;
+  const label = name || (id ? `#${id}` : 'Khách');
+  if (!id) return <span className={`uname ${className}`} style={style}>{label}</span>;
+  return <Link to={`/u/${id}`} className={`uname ${className}`} style={style}>{label}</Link>;
+}
+
+export function UserList({ users }) {
+  return users.map((u, i) => (
+    <React.Fragment key={`${u.userId ?? u.id}-${i}`}>
+      {i > 0 && ', '}
+      <UserLink id={u.userId ?? u.id} name={u.username} />
+    </React.Fragment>
+  ));
 }
 
 export function ForumRow({ forum }) {
@@ -93,7 +108,7 @@ export function ForumRow({ forum }) {
         {forum.moderators?.length > 0 && (
           <p className="frow-sub">
             <span className="muted">Quản lý: </span>
-            {forum.moderators.map((m) => m.username).join(', ')}
+            <UserList users={forum.moderators} />
           </p>
         )}
       </div>
@@ -107,7 +122,9 @@ export function ForumRow({ forum }) {
             <Link to={`/p/${forum.last.postId}`} className="frow-last-title">
               {forum.last.threadTitle || 'Bài mới nhất'}
             </Link>
-            <span className="muted">{forum.last.poster}, {formatDate(forum.last.time)}</span>
+            <span className="muted">
+              <UserLink id={forum.last.posterId} name={forum.last.poster} />, {formatDate(forum.last.time)}
+            </span>
           </>
         ) : (
           <span className="muted">Chưa có bài</span>
@@ -117,7 +134,7 @@ export function ForumRow({ forum }) {
   );
 }
 
-export function ThreadRow({ thread: t }) {
+export function ThreadRow({ thread: t, showForum = false }) {
   const to = `/t/${t.movedTo || t.id}`;
   const classes = ['trow'];
   if (t.sticky) classes.push('is-sticky');
@@ -136,7 +153,12 @@ export function ThreadRow({ thread: t }) {
           <Link to={to}>{t.title}</Link>
         </div>
         <div className="trow-meta muted">
-          {t.starter.username || 'Khách'}, {formatDate(t.dateline)}
+          <UserLink id={t.starter.userId} name={t.starter.username} />, {formatDate(t.dateline)}
+          {showForum && t.forumTitle && (
+            <>
+              {' '}trong <Link to={`/f/${t.forumId}`}>{t.forumTitle}</Link>
+            </>
+          )}
         </div>
       </div>
       {!t.movedTo && (
@@ -148,8 +170,9 @@ export function ThreadRow({ thread: t }) {
           <div className="trow-last">
             {t.last.time ? (
               <>
+                <span className="last-label muted">Bài cuối</span>
                 <Link to={`/p/${t.last.postId}`}>{formatDate(t.last.time)}</Link>
-                <span className="muted">{t.last.poster}</span>
+                <span className="muted"><UserLink id={t.last.posterId} name={t.last.poster} /></span>
               </>
             ) : null}
           </div>
@@ -164,22 +187,35 @@ export function Announcements({ items }) {
   return (
     <section className="notices" aria-label="Thông báo">
       {items.map((a) => (
-        <Announcement key={a.id} item={a} />
+        <details key={a.id} className="notice">
+          <summary className="notice-toggle">
+            <Label tone="pin">Thông báo</Label>
+            <span className="notice-title">{a.title}</span>
+            <span className="muted notice-meta">{a.author.username}, {formatDate(a.startDate)}</span>
+          </summary>
+          <BBCode text={a.pagetext} className="bb notice-body" />
+        </details>
       ))}
     </section>
   );
 }
 
-function Announcement({ item }) {
-  const [open, setOpen] = useState(false);
+// Thanh tab cuộn ngang được trên điện thoại.
+export function Tabs({ items }) {
   return (
-    <div className="notice">
-      <button type="button" className="notice-toggle" aria-expanded={open} onClick={() => setOpen(!open)}>
-        <Label tone="pin">Thông báo</Label>
-        <span className="notice-title">{item.title}</span>
-        <span className="muted notice-meta">{item.author.username}, {formatDate(item.startDate)}</span>
-      </button>
-      {open && <BBCode text={item.pagetext} className="bb notice-body" />}
-    </div>
+    <nav className="tabs" aria-label="Mục">
+      {items.map((it) => (
+        <Link
+          key={it.to}
+          to={it.to}
+          state={{ keepScroll: true }}
+          className={`tab${it.active ? ' is-active' : ''}`}
+          aria-current={it.active ? 'page' : undefined}
+        >
+          {it.label}
+          {it.count != null && <span className="tab-count">{formatNumber(it.count)}</span>}
+        </Link>
+      ))}
+    </nav>
   );
 }
