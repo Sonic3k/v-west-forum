@@ -135,7 +135,21 @@ export function safeUrl(input) {
   if (/^(https?|ftp):\/\//i.test(s)) return s;
   if (/^mailto:/i.test(s)) return s;
   if (/^www\./i.test(s)) return `http://${s}`;
-  if (/^(showthread|forumdisplay|member)\.php/i.test(s)) return s;
+  if (/^(showthread|forumdisplay|member|attachment)\.php/i.test(s)) return s;
+  return null;
+}
+
+// Ảnh trỏ về file đính kèm của chính forum cũ (attachment.php?attachmentid=...) → lấy từ database.
+export function internalImage(src) {
+  let url;
+  try {
+    url = new URL(src, 'http://local.invalid/');
+  } catch {
+    return null;
+  }
+  if (url.host !== 'local.invalid' && !/westlife/i.test(url.host)) return null;
+  const id = url.searchParams.get('attachmentid');
+  if (/attachment\.php$/i.test(url.pathname) && id && /^\d+$/.test(id)) return `/api/attachments/${id}`;
   return null;
 }
 

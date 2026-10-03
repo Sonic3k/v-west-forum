@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { parseBBCode, nodeText, safeUrl, internalRoute } from '../lib/bbcode.js';
+import { parseBBCode, nodeText, safeUrl, internalRoute, internalImage } from '../lib/bbcode.js';
 import { decodeEntities } from '../lib/text.js';
 import { useSmilies } from '../lib/smilies.jsx';
 
@@ -160,6 +160,8 @@ function renderNode(node, ctx, key) {
     }
     case 'img': {
       const src = safeUrl(node.raw);
+      const local = src ? internalImage(src) : null;
+      if (local) return <RemoteImage key={key} src={local} />;
       return src && /^https?:/i.test(src) ? <RemoteImage key={key} src={src} /> : renderText(node.raw, key);
     }
     case 'quote': return <Quote key={key} opt={node.opt}>{kids()}</Quote>;
