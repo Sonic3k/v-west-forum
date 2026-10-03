@@ -149,7 +149,7 @@ function ProfileTab({ data }) {
       {user.signature && (
         <section className="profile-block">
           <h2 className="block-title">Chữ ký</h2>
-          <BBCode text={user.signature} className="bb sig sig-full" />
+          <BBCode text={user.signature} sigpic={user.sigpic} className="bb sig sig-full" />
         </section>
       )}
     </div>

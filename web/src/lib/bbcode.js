@@ -4,10 +4,10 @@ import { decodeEntities } from './text.js';
 const KNOWN = new Set([
   'b', 'i', 'u', 's', 'strike', 'sub', 'sup', 'color', 'size', 'font', 'highlight',
   'left', 'center', 'right', 'indent', 'url', 'email', 'img', 'quote',
-  'code', 'php', 'html', 'noparse', 'list', '*', 'attach', 'youtube', 'video',
+  'code', 'php', 'html', 'noparse', 'list', '*', 'attach', 'youtube', 'video', 'sigpic',
 ]);
 // Nội dung bên trong được lấy nguyên văn, không phân tích thẻ lồng.
-const RAW = new Set(['code', 'php', 'html', 'noparse', 'img', 'attach', 'youtube', 'video', 'email']);
+const RAW = new Set(['code', 'php', 'html', 'noparse', 'img', 'attach', 'youtube', 'video', 'email', 'sigpic']);
 // Thẻ dạng khối: bỏ một dòng trống ngay sau thẻ mở/đóng như vBulletin.
 const BLOCK = new Set(['quote', 'left', 'center', 'right', 'indent', 'list', 'code', 'php', 'html']);
 

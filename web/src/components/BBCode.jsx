@@ -9,10 +9,10 @@ const COLOR_RE = /^(#[0-9a-f]{3,8}|[a-z]{3,20})$/i;
 const FONT_RE = /^[\w\s,'-]{1,60}$/;
 const URL_RE = /\bhttps?:\/\/[^\s<>"'[\]]+/gi;
 
-export default function BBCode({ text, tree, attachments, className = 'bb' }) {
+export default function BBCode({ text, tree, attachments, sigpic, className = 'bb' }) {
   const smilies = useSmilies();
   const root = useMemo(() => tree || parseBBCode(text), [text, tree]);
-  return <div className={className}>{renderNodes(root.children, { attachments, smilies }, 'n')}</div>;
+  return <div className={className}>{renderNodes(root.children, { attachments, smilies, sigpic }, 'n')}</div>;
 }
 
 // Thay mã smilie (ví dụ 3lol3) bằng ảnh trong một đoạn chữ thường.
@@ -186,6 +186,10 @@ function renderNode(node, ctx, key) {
         ? <SmartLink key={key} href={`https://www.youtube.com/watch?v=${vid}`}>Video YouTube ({vid})</SmartLink>
         : renderText(node.raw, key);
     }
+    case 'sigpic':
+      return ctx.sigpic
+        ? <RemoteImage key={key} src={ctx.sigpic} alt={decodeEntities(node.raw || '').trim() || 'Ảnh chữ ký'} />
+        : null;
     case 'video': {
       const href = safeUrl(node.raw);
       return href ? <SmartLink key={key} href={href}>{href}</SmartLink> : renderText(node.raw, key);

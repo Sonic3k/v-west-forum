@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { q } from '../db.js';
 import { getLookups, breadcrumb, mapThread, mapUser, THREAD_COLS } from '../lookups.js';
-import { avatarUrl, getAssets } from '../assets.js';
+import { avatarUrl, getAssets, sigpicUrl } from '../assets.js';
 import { clean, toInt } from '../text.js';
 
 export const threadsRouter = Router();
@@ -75,6 +75,7 @@ async function loadPosts(lk, threadId, offset, limit) {
     author: userMap.get(p.userid) || null,
     username: clean(p.username),
     signature: p.showsignature && sigMap.get(p.userid) ? sigMap.get(p.userid) : null,
+    sigpic: p.showsignature ? sigpicUrl(assets, p.userid) : null,
     attachments: attachBy.get(p.postid) || [],
     thanks: (thanksBy.get(p.postid) || []).map((t) => ({
       userId: t.userid, username: clean(t.username), date: t.date,

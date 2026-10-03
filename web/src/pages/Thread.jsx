@@ -98,7 +98,7 @@ function Post({ post, attachments }) {
           {extra.length > 0 && <AttachmentList items={extra} />}
           {post.thanks.length > 0 && <Thanks list={post.thanks} />}
           {post.comments.length > 0 && <Comments list={post.comments} />}
-          {post.signature && <BBCode text={post.signature} className="bb sig" />}
+          {post.signature && <BBCode text={post.signature} sigpic={post.sigpic} className="bb sig" />}
         </div>
       </div>
     </article>

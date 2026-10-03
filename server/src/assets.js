@@ -32,7 +32,10 @@ export function getAssets() {
 }
 
 function emptyAssets() {
-  return { fileAvatars: new Map(), profilePics: new Map(), dbAvatars: new Set(), predefined: new Map(), smilies: [], count: 0 };
+  return {
+    fileAvatars: new Map(), profilePics: new Map(), sigpics: new Map(),
+    dbAvatars: new Set(), predefined: new Map(), smilies: [], count: 0,
+  };
 }
 
 export function normPath(p) {
@@ -52,9 +55,10 @@ async function build() {
   const imagesByPath = new Map();
   const imagesByName = new Map();
 
+  const perUser = { avatar: result.fileAvatars, profilepic: result.profilePics, sigpic: result.sigpics };
   for (const a of assetRows) {
-    if (a.kind === 'avatar' || a.kind === 'profilepic') {
-      const target = a.kind === 'avatar' ? result.fileAvatars : result.profilePics;
+    if (perUser[a.kind]) {
+      const target = perUser[a.kind];
       const current = target.get(a.userid);
       if (a.userid && (!current || a.revision > current.revision)) target.set(a.userid, { id: a.id, revision: a.revision });
       continue;
@@ -108,5 +112,11 @@ export function avatarUrl(assets, userId, avatarId) {
 
 export function profilePicUrl(assets, userId) {
   const pic = assets?.profilePics.get(userId);
+  return pic ? `/api/assets/${pic.id}` : null;
+}
+
+// Ảnh chữ ký, hiện ở chỗ thẻ [SIGPIC] trong chữ ký.
+export function sigpicUrl(assets, userId) {
+  const pic = assets?.sigpics.get(userId);
   return pic ? `/api/assets/${pic.id}` : null;
 }

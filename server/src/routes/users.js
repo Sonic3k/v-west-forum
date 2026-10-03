@@ -4,7 +4,7 @@ import { getLookups, mapThread, moderatedBy, THREAD_COLS } from '../lookups.js';
 import { fold, getUsers, groupOf, nameRef, userBrief } from '../users.js';
 import { clean, decodeEntities, toInt } from '../text.js';
 import { parseFolders, parseRecipients } from '../php.js';
-import { avatarUrl, getAssets, profilePicUrl } from '../assets.js';
+import { avatarUrl, getAssets, profilePicUrl, sigpicUrl } from '../assets.js';
 
 export const usersRouter = Router();
 
@@ -140,6 +140,7 @@ usersRouter.get('/:id', async (req, res) => {
       color: group?.color || null,
       avatar: avatarUrl(assets, u.userid, u.avatarid),
       profilePic: profilePicUrl(assets, u.userid),
+      sigpic: sigpicUrl(assets, u.userid),
       title: clean(u.usertitle),
       group: group?.title || null,
       groups: groupIds.map((g) => lk.groups.get(g)?.title).filter(Boolean),
