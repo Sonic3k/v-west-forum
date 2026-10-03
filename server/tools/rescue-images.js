@@ -18,16 +18,53 @@
 //          --concurrency <n>   parallel downloads (default 4)
 //          --wayback           retry dead links through the Internet Archive Wayback Machine
 //          --rescan            read the link list from the database again
+//          --refetch           download already saved images again and overwrite them (keeps the old file on failure)
+//          --profile <name>    request style: "navigate" (like typing the link in a browser) or "image" (like an
+//                              <img> tag). Default: navigate for Photobucket (avoids the watermark), image otherwise.
+//          --probe <url>       download one link in several ways into _probe/ to compare the results by eye
 // Safe to re-run at any time: finished links are skipped, interrupted runs continue where they stopped.
 import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import http from 'node:http';
+import https from 'node:https';
+import zlib from 'node:zlib';
 import mysql from 'mysql2/promise';
 import { providerOf } from '../src/providers.js';
 
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+// How a request looks to the server. Photobucket serves the original only to a "navigate" request
+// (a link typed into the browser); embedded-image style requests get a watermarked copy.
+// Some hosts (e.g. imgur) answer a navigate request with an HTML page, so "image" stays the default elsewhere.
+const PROFILES = {
+  image: {
+    'User-Agent': UA,
+    Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+  },
+  navigate: {
+    'User-Agent': UA,
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-User': '?1',
+    'Upgrade-Insecure-Requests': '1',
+    'sec-ch-ua': '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+  },
+};
+
+function profileFor(provider, override) {
+  if (override && PROFILES[override]) return override;
+  return provider === 'photobucket' ? 'navigate' : 'image';
+}
 const TIMEOUT_MS = 30000;
+const MAX_BYTES = 30 * 1024 * 1024;
 const SUSPECT_MIN_URLS = 8; // identical bytes behind >= 8 different links => most likely a placeholder banner
 const FINAL = new Set(['ok', 'not_found', 'suspect']);
 const IMAGES_DIR = 'images';
@@ -35,7 +72,10 @@ const SUSPECT_DIR = '_suspected-placeholders';
 
 // ---------- arguments ----------
 function parseArgs(argv) {
-  const opts = { out: null, host: null, provider: null, sample: 0, concurrency: 4, wayback: false, rescan: false };
+  const opts = {
+    out: null, host: null, provider: null, sample: 0, concurrency: 4,
+    wayback: false, rescan: false, refetch: false, profile: null, probe: null,
+  };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--out') opts.out = argv[++i];
@@ -45,6 +85,9 @@ function parseArgs(argv) {
     else if (a === '--concurrency') opts.concurrency = Math.max(1, Math.min(16, Number(argv[++i]) || 4));
     else if (a === '--wayback') opts.wayback = true;
     else if (a === '--rescan') opts.rescan = true;
+    else if (a === '--refetch') opts.refetch = true;
+    else if (a === '--profile') opts.profile = String(argv[++i] || '').toLowerCase();
+    else if (a === '--probe') opts.probe = argv[++i];
   }
   return opts;
 }
@@ -128,30 +171,64 @@ function sniff(buf) {
   return null;
 }
 
-async function fetchBytes(url) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
-  try {
-    const res = await fetch(url, {
-      headers: { 'User-Agent': UA, Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8' },
-      redirect: 'follow',
-      signal: ctrl.signal,
+// Plain node:http(s) instead of fetch(): fetch() rewrites some headers (e.g. Sec-Fetch-Mode: cors),
+// which would make a "navigate" request look like an embedded one.
+function fetchBytes(url, headers = PROFILES.image, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    let target;
+    try {
+      target = new URL(url);
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    const lib = target.protocol === 'https:' ? https : http;
+    const req = lib.request(target, { method: 'GET', headers, timeout: TIMEOUT_MS }, (res) => {
+      const { statusCode } = res;
+      if ([301, 302, 303, 307, 308].includes(statusCode) && res.headers.location && redirects < 6) {
+        res.resume();
+        resolve(fetchBytes(new URL(res.headers.location, target).href, headers, redirects + 1));
+        return;
+      }
+      const chunks = [];
+      let size = 0;
+      res.on('data', (chunk) => {
+        size += chunk.length;
+        if (size > MAX_BYTES) req.destroy(new Error('file too large'));
+        else chunks.push(chunk);
+      });
+      res.on('end', () => {
+        let buf = Buffer.concat(chunks);
+        const encoding = String(res.headers['content-encoding'] || '').toLowerCase();
+        try {
+          if (encoding === 'gzip') buf = zlib.gunzipSync(buf);
+          else if (encoding === 'deflate') buf = zlib.inflateSync(buf);
+          else if (encoding === 'br') buf = zlib.brotliDecompressSync(buf);
+        } catch {
+          // keep raw bytes
+        }
+        resolve({ status: statusCode, finalUrl: target.href, buf });
+      });
+      res.on('error', reject);
     });
-    const buf = Buffer.from(await res.arrayBuffer());
-    return { status: res.status, finalUrl: res.url, buf };
-  } finally {
-    clearTimeout(timer);
-  }
+    req.on('timeout', () => {
+      const err = new Error('timeout');
+      err.name = 'AbortError';
+      req.destroy(err);
+    });
+    req.on('error', reject);
+    req.end();
+  });
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // One address, retried on network errors and rate limiting.
-async function attempt(target) {
+async function attempt(target, headers) {
   let last = { status: 'error', detail: 'download failed' };
   for (let i = 0; i < 2; i += 1) {
     try {
-      const r = await fetchBytes(target);
+      const r = await fetchBytes(target, headers);
       if (r.status === 429 || r.status === 503) {
         last = { status: `http_${r.status}`, detail: 'rate limited' };
         await sleep(20000);
@@ -163,7 +240,7 @@ async function attempt(target) {
       if (!ext) return { status: 'not_image', finalUrl: r.finalUrl, bytes: r.buf.length };
       return { status: 'ok', ext, buf: r.buf, finalUrl: r.finalUrl };
     } catch (err) {
-      last = { status: 'error', detail: err.name === 'AbortError' ? 'timeout' : (err.cause?.code || err.message) };
+      last = { status: 'error', detail: err.name === 'AbortError' ? 'timeout' : (err.code || err.cause?.code || err.message) };
       await sleep(1500);
     }
   }
@@ -171,12 +248,15 @@ async function attempt(target) {
 }
 
 // Original link first; the https variant only when the http link got no answer at all.
-async function tryDownload(url) {
-  const candidates = [url];
-  if (url.startsWith('http://')) candidates.push(`https://${url.slice(7)}`);
+// Photobucket: https first (that is what a browser opens today).
+async function tryDownload(url, profile = 'image') {
+  const headers = PROFILES[profile] || PROFILES.image;
+  const https = url.startsWith('http://') ? `https://${url.slice(7)}` : null;
+  let candidates = https ? [url, https] : [url];
+  if (https && providerOf(new URL(url).hostname) === 'photobucket') candidates = [https, url];
   let best = null;
   for (const candidate of candidates) {
-    const r = await attempt(candidate);
+    const r = await attempt(candidate, headers);
     if (r.status === 'ok') return r;
     if (!best || (best.status === 'error' && r.status !== 'error')) best = r;
     if (r.status !== 'error') break;
@@ -187,7 +267,7 @@ async function tryDownload(url) {
 async function waybackDownload(url) {
   const api = `https://archive.org/wayback/available?url=${encodeURIComponent(url)}&timestamp=20120101`;
   try {
-    const r = await fetchBytes(api);
+    const r = await fetchBytes(api, { 'User-Agent': UA, Accept: 'application/json' });
     if (r.status !== 200) return { status: `wayback_http_${r.status}` };
     const snap = JSON.parse(r.buf.toString('utf8'))?.archived_snapshots?.closest;
     if (!snap?.available || String(snap.status) !== '200') return { status: 'wayback_none' };
@@ -323,6 +403,39 @@ async function markSuspects(out, manifest, manifestFile) {
   return report;
 }
 
+// ---------- probe ----------
+// Download one link in several ways so the results can be compared by eye.
+async function probe(out, url) {
+  const dir = path.join(out, '_probe');
+  await fs.mkdir(dir, { recursive: true });
+  const https = url.replace(/^http:\/\//i, 'https://');
+  const http = url.replace(/^https:\/\//i, 'http://');
+  const u = new URL(https);
+  const variants = [
+    ['1-https-navigate', https, 'navigate'],
+    ['2-http-navigate', http, 'navigate'],
+    ['3-https-image', https, 'image'],
+    ['4-http-image', http, 'image'],
+  ];
+  if (/photobucket\.com$/i.test(u.hostname)) {
+    variants.push(['5-hosting-navigate', `https://hosting.photobucket.com${u.pathname}`, 'navigate']);
+  }
+  console.log(`Probing ${url}`);
+  for (const [name, target, profile] of variants) {
+    const r = await attempt(target, PROFILES[profile]);
+    let line = `  ${name.padEnd(20)} ${r.status.padEnd(10)}`;
+    if (r.status === 'ok') {
+      const file = path.join(dir, `${name}.${r.ext}`);
+      await fs.writeFile(file, r.buf);
+      const hash = crypto.createHash('sha256').update(r.buf).digest('hex').slice(0, 12);
+      line += ` ${String(r.buf.length).padStart(8)} bytes  sha ${hash}`;
+    }
+    if (r.finalUrl && r.finalUrl !== target) line += `  -> ${r.finalUrl}`;
+    console.log(line);
+  }
+  console.log(`Saved to ${dir}. Open the files and check which ones have no watermark.`);
+}
+
 // ---------- reports ----------
 // Labels written by the first version of this tool.
 const OLD_LABELS = {
@@ -389,6 +502,10 @@ async function main() {
   }
   const out = path.resolve(opts.out);
   await fs.mkdir(out, { recursive: true });
+  if (opts.probe) {
+    await probe(out, opts.probe);
+    return;
+  }
   const urlsFile = path.join(out, 'urls.json');
   const manifestFile = path.join(out, 'manifest.jsonl');
 
@@ -414,7 +531,14 @@ async function main() {
   let list = all;
   if (opts.provider) list = list.filter((u) => u.provider === opts.provider);
   if (opts.host) list = list.filter((u) => u.host.includes(opts.host));
-  if (opts.wayback) {
+  if (opts.refetch) {
+    // Saved images whose last download used a different request style than the one chosen now.
+    list = list.filter((u) => {
+      const rec = manifest.get(u.url);
+      const wanted = profileFor(u.provider, opts.profile);
+      return rec?.status === 'ok' && !String(rec.source || '').startsWith('wayback') && (rec.profile || 'image') !== wanted;
+    });
+  } else if (opts.wayback) {
     list = list.filter((u) => {
       const rec = manifest.get(u.url);
       return rec && rec.status && rec.status !== 'ok' && rec.status !== 'suspect' && !rec.waybackTried;
@@ -429,7 +553,8 @@ async function main() {
     const step = list.length / opts.sample;
     list = Array.from({ length: opts.sample }, (_, i) => list[Math.floor(i * step)]);
   }
-  console.log(`Processing ${list.length} links${opts.wayback ? ' through the Wayback Machine' : ''}...`);
+  const mode = opts.refetch ? ' again (refetch)' : opts.wayback ? ' through the Wayback Machine' : '';
+  console.log(`Processing ${list.length} links${mode}...`);
 
   const counts = {};
   let done = 0;
@@ -440,12 +565,18 @@ async function main() {
     while (index < list.length) {
       const item = list[index];
       index += 1;
-      const result = opts.wayback ? await waybackDownload(item.url) : await tryDownload(item.url);
+      const profile = profileFor(item.provider, opts.profile);
+      const previous = manifest.get(item.url) || {};
+      const result = opts.wayback ? await waybackDownload(item.url) : await tryDownload(item.url, profile);
       const rec = { url: item.url, at: new Date().toISOString() };
       if (opts.wayback) {
         rec.waybackTried = true;
         if (result.status === 'ok') rec.status = 'ok';
         else rec.wayback = result.status;
+      } else if (opts.refetch) {
+        // Never lose a saved image: on failure keep the old file and record why.
+        if (result.status === 'ok') rec.status = 'ok';
+        else rec.refetchFailed = result.status;
       } else {
         rec.status = result.status;
       }
@@ -455,17 +586,22 @@ async function main() {
         const file = localPath(out, item.url, result.ext);
         await fs.mkdir(path.dirname(file), { recursive: true });
         await fs.writeFile(file, result.buf);
+        const relative = path.relative(out, file);
+        if (opts.refetch && previous.file && previous.file !== relative) {
+          await fs.rm(path.join(out, previous.file), { force: true });
+        }
         Object.assign(rec, {
-          file: path.relative(out, file),
+          file: relative,
           ext: result.ext,
           bytes: result.buf.length,
           sha256: crypto.createHash('sha256').update(result.buf).digest('hex'),
           source: opts.wayback ? `wayback ${result.snapshot}` : 'direct',
+          profile: opts.wayback ? 'image' : profile,
         });
       }
       manifest.set(item.url, { ...(manifest.get(item.url) || {}), ...rec });
       await fs.appendFile(manifestFile, `${JSON.stringify(rec)}\n`);
-      const label = rec.status || rec.wayback;
+      const label = opts.refetch ? (rec.status === 'ok' ? 'replaced' : `kept_old (${rec.refetchFailed})`) : (rec.status || rec.wayback);
       counts[label] = (counts[label] || 0) + 1;
       done += 1;
       if (done % 25 === 0 || done === list.length) {
