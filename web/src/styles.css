@@ -256,8 +256,8 @@ a:focus-visible, button:focus-visible, select:focus-visible {
 .result-count { font-size: 13px; margin: 0 0 6px; }
 .mlist { list-style: none; margin: 0; padding: 0; border-top: 2px solid var(--ink); }
 .mrow {
-  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 24px; align-items: baseline;
-  padding: 11px 4px; border-bottom: 1px solid var(--rule);
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 14px; align-items: center;
+  padding: 10px 4px; border-bottom: 1px solid var(--rule);
 }
 .mrow-main { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; min-width: 0; }
 .mrow-name { font-weight: 600; font-size: 16px; }
@@ -353,6 +353,68 @@ a:focus-visible, button:focus-visible, select:focus-visible {
 .bubble-title { margin: 4px 0 0; font-weight: 600; font-size: 14px; }
 .bubble-body { margin-top: 4px; font: 400 16px/1.6 var(--read); overflow-wrap: anywhere; }
 
+
+/* Avatar */
+.avatar {
+  display: inline-block; flex: 0 0 auto; object-fit: cover; border-radius: 6px;
+  background: var(--quote-bg); border: 1px solid var(--rule);
+}
+.avatar-sm { width: 32px; height: 32px; border-radius: 4px; }
+.avatar-md { width: 72px; height: 72px; margin-bottom: 6px; }
+.avatar-lg { width: 84px; height: 84px; }
+.avatar-empty {
+  display: inline-flex; align-items: center; justify-content: center;
+  font: 600 15px/1 var(--read); color: var(--muted);
+}
+.avatar-md.avatar-empty { font-size: 26px; }
+.avatar-lg.avatar-empty { font-size: 32px; }
+.smilie { vertical-align: middle; max-height: 40px; }
+.member-top { display: flex; align-items: center; gap: 14px; }
+.member-top .page-title { margin: 0; }
+.profile-pic { max-width: 100%; height: auto; border: 1px solid var(--rule); }
+
+/* Nút và ô tìm kiếm */
+.btn {
+  font: 600 15px/1 var(--ui); color: var(--paper); background: var(--ink);
+  border: 1px solid var(--ink); border-radius: 3px; padding: 10px 16px; min-height: 40px; cursor: pointer;
+}
+.btn:hover { background: var(--link-hover); border-color: var(--link-hover); }
+.btn:disabled { opacity: 0.6; cursor: progress; }
+.btn-quiet { background: var(--surface); color: var(--ink); border-color: var(--rule-strong); }
+.btn-quiet:hover { background: var(--paper); color: var(--ink); border-color: var(--link); }
+button.seg-item { font: inherit; font-size: 14px; background: none; cursor: pointer; }
+button.seg-item.is-active { background: var(--ink); color: var(--paper); }
+.search-form { margin: 4px 0 18px; }
+.search-row { display: flex; gap: 8px; }
+.search-row input {
+  flex: 1 1 auto; min-width: 0; font: inherit; font-size: 16px; color: var(--ink); background: var(--surface);
+  border: 1px solid var(--rule-strong); border-radius: 3px; padding: 8px 10px; min-height: 40px;
+}
+.hint { font-size: 13px; margin: 6px 0; }
+.search-form .filters { margin-top: 10px; }
+.feed-snippet mark { background: #fbe9a6; color: inherit; padding: 0 1px; }
+.page-actions { margin: 0 0 6px; font-size: 14px; }
+.is-loading { opacity: 0.6; }
+
+/* Trang xuất chủ đề */
+.export-actions { margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px solid var(--rule); }
+.export-buttons { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 4px; }
+.export-doc { max-width: 760px; }
+.export-meta { color: var(--muted); font-size: 14px; }
+.export-post { border-top: 1px solid var(--rule); padding: 12px 0 16px; font: 400 16px/1.65 var(--read); }
+.export-post header { font: 13px/1.5 var(--ui); color: var(--muted); margin-bottom: 4px; }
+.export-post header strong { color: var(--ink); }
+.export-extra { font: 13px/1.5 var(--ui); color: var(--muted); margin: 6px 0 0; }
+.export-attach img { max-width: 100%; height: auto; margin: 6px 0; }
+
+@media print {
+  body { background: #fff; }
+  .site-head, .no-print { display: none !important; }
+  .page { max-width: none; padding: 0; }
+  .export-post { break-inside: avoid-page; }
+  a { color: inherit; }
+}
+
 /* Điện thoại */
 @media (max-width: 760px) {
   body { font-size: 15px; }
@@ -387,8 +449,13 @@ a:focus-visible, button:focus-visible, select:focus-visible {
   .attachments li { max-width: none; }
   .attachments img { max-width: 100%; width: 100%; max-height: 160px; }
 
-  .mrow { grid-template-columns: 1fr; }
-  .mrow-stats { flex-wrap: wrap; gap: 2px 12px; white-space: normal; }
+  .mrow { grid-template-columns: auto minmax(0, 1fr); align-items: start; }
+  .mrow-stats { grid-column: 2; flex-wrap: wrap; gap: 2px 12px; white-space: normal; }
+  .site-nav a { padding: 6px 7px; font-size: 14px; }
+  .author .avatar-md { width: 36px; height: 36px; margin: 0; font-size: 16px; }
+  .author { align-items: center; }
+  .avatar-lg { width: 64px; height: 64px; }
+  .search-row .btn { padding: 10px 14px; }
   .profile { grid-template-columns: 1fr; }
   .fact { grid-template-columns: 1fr; }
   .fact dt { font-size: 13px; }

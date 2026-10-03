@@ -1,5 +1,6 @@
 import { q } from './db.js';
 import { clean } from './text.js';
+import { avatarUrl } from './assets.js';
 
 // Bỏ dấu tiếng Việt và chữ hoa để tìm "thao" ra "Thảo", "dung" ra "Dũng", "Đức".
 export function fold(input) {
@@ -26,7 +27,7 @@ export function getUsers() {
 
 async function build() {
   const rows = await q(`SELECT userid, username, usergroupid, displaygroupid, membergroupids,
-                               joindate, lastactivity, posts, usertitle
+                               joindate, lastactivity, posts, usertitle, avatarid
                           FROM user`);
   const list = rows.map((r) => {
     const username = clean(r.username) || `#${r.userid}`;
@@ -44,6 +45,7 @@ async function build() {
       lastActivity: r.lastactivity,
       posts: r.posts,
       title: clean(r.usertitle),
+      avatarid: r.avatarid,
     };
   });
   return { list, byId: new Map(list.map((u) => [u.id, u])) };
@@ -53,10 +55,11 @@ export function groupOf(lk, u) {
   return lk.groups.get(u.displaygroupid || u.usergroupid) || lk.groups.get(u.usergroupid) || null;
 }
 
-export function userBrief(lk, u) {
+export function userBrief(lk, u, assets = null) {
   const group = groupOf(lk, u);
   return {
     id: u.id,
+    avatar: avatarUrl(assets, u.id, u.avatarid),
     username: u.username,
     color: group?.color || null,
     group: group?.title || null,

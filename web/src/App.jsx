@@ -7,6 +7,9 @@ import PostRedirect from './pages/PostRedirect.jsx';
 import Members from './pages/Members.jsx';
 import Member from './pages/Member.jsx';
 import Conversation from './pages/Conversation.jsx';
+import Search from './pages/Search.jsx';
+import ThreadExport from './pages/ThreadExport.jsx';
+import { SmiliesProvider } from './lib/smilies.jsx';
 import NotFound from './pages/NotFound.jsx';
 
 // Lên đầu trang khi đổi trang; giữ nguyên vị trí khi chỉ đổi tab trong trang thành viên.
@@ -20,7 +23,7 @@ function ScrollToTop() {
 
 export default function App() {
   return (
-    <>
+    <SmiliesProvider>
       <ScrollToTop />
       <header className="site-head">
         <div className="site-head-inner">
@@ -28,6 +31,7 @@ export default function App() {
           <nav className="site-nav" aria-label="Chính">
             <NavLink to="/" end>Diễn đàn</NavLink>
             <NavLink to="/u">Thành viên</NavLink>
+            <NavLink to="/search">Tìm kiếm</NavLink>
           </nav>
           <span className="brand-sub">Bản sao lưu ngày 11/12/2012</span>
         </div>
@@ -36,6 +40,8 @@ export default function App() {
         <Route path="/" element={<Home />} />
         <Route path="/f/:id" element={<Forum />} />
         <Route path="/t/:id" element={<Thread />} />
+        <Route path="/t/:id/export" element={<ThreadExport />} />
+        <Route path="/search" element={<Search />} />
         <Route path="/p/:id" element={<PostRedirect />} />
         <Route path="/u" element={<Members />} />
         <Route path="/u/:id" element={<Member />} />
@@ -43,6 +49,6 @@ export default function App() {
         <Route path="/u/:id/:kind/:other" element={<Conversation />} />
         <Route path="*" element={<NotFound />} />
       </Routes>
-    </>
+    </SmiliesProvider>
   );
 }

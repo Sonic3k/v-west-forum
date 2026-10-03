@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { parseBBCode, nodeText, safeUrl, internalRoute } from '../lib/bbcode.js';
 import { decodeEntities } from '../lib/text.js';
+import { useSmilies } from '../lib/smilies.jsx';
 
 const SIZES = { 1: '0.75em', 2: '0.875em', 3: '1em', 4: '1.25em', 5: '1.5em', 6: '1.875em', 7: '2.25em' };
 const COLOR_RE = /^(#[0-9a-f]{3,8}|[a-z]{3,20})$/i;
@@ -9,8 +10,32 @@ const FONT_RE = /^[\w\s,'-]{1,60}$/;
 const URL_RE = /\bhttps?:\/\/[^\s<>"'[\]]+/gi;
 
 export default function BBCode({ text, tree, attachments, className = 'bb' }) {
+  const smilies = useSmilies();
   const root = useMemo(() => tree || parseBBCode(text), [text, tree]);
-  return <div className={className}>{renderNodes(root.children, { attachments }, 'n')}</div>;
+  return <div className={className}>{renderNodes(root.children, { attachments, smilies }, 'n')}</div>;
+}
+
+// Thay mã smilie (ví dụ 3lol3) bằng ảnh trong một đoạn chữ thường.
+function withSmilies(text, smilies, keyPrefix) {
+  if (!smilies || !text) return [text];
+  const out = [];
+  let idx = 0;
+  for (const m of text.matchAll(smilies.re)) {
+    if (m.index > idx) out.push(text.slice(idx, m.index));
+    out.push(
+      <img
+        key={`${keyPrefix}s${m.index}`}
+        className="smilie"
+        src={smilies.map.get(m[0])}
+        alt={m[0]}
+        title={m[0]}
+        loading="lazy"
+      />,
+    );
+    idx = m.index + m[0].length;
+  }
+  if (idx < text.length) out.push(text.slice(idx));
+  return out;
 }
 
 function renderNodes(nodes, ctx, prefix) {
@@ -76,14 +101,14 @@ function Quote({ opt, children }) {
   );
 }
 
-function renderText(str, key) {
+function renderText(str, key, ctx = {}) {
   const s = decodeEntities(str);
   const out = [];
   s.split('\n').forEach((line, li) => {
     if (li > 0) out.push(<br key={`br${li}`} />);
     let idx = 0;
     for (const m of line.matchAll(URL_RE)) {
-      if (m.index > idx) out.push(line.slice(idx, m.index));
+      if (m.index > idx) out.push(...withSmilies(line.slice(idx, m.index), ctx.smilies, `${li}.${idx}`));
       out.push(
         <SmartLink key={`u${li}.${m.index}`} href={m[0]}>
           {m[0]}
@@ -91,13 +116,13 @@ function renderText(str, key) {
       );
       idx = m.index + m[0].length;
     }
-    if (idx < line.length) out.push(line.slice(idx));
+    if (idx < line.length) out.push(...withSmilies(line.slice(idx), ctx.smilies, `${li}.${idx}`));
   });
   return <React.Fragment key={key}>{out}</React.Fragment>;
 }
 
 function renderNode(node, ctx, key) {
-  if (typeof node === 'string') return renderText(node, key);
+  if (typeof node === 'string') return renderText(node, key, ctx);
   const kids = () => renderNodes(node.children, ctx, key);
   const plain = () => <React.Fragment key={key}>{kids()}</React.Fragment>;
 

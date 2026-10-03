@@ -4,6 +4,7 @@ import { getLookups, mapThread, moderatedBy, THREAD_COLS } from '../lookups.js';
 import { fold, getUsers, groupOf, nameRef, userBrief } from '../users.js';
 import { clean, decodeEntities, toInt } from '../text.js';
 import { parseFolders, parseRecipients } from '../php.js';
+import { avatarUrl, getAssets, profilePicUrl } from '../assets.js';
 
 export const usersRouter = Router();
 
@@ -28,8 +29,8 @@ function paging(req, total, perPage) {
 }
 
 async function context() {
-  const [lk, users] = await Promise.all([getLookups(), getUsers()]);
-  return { lk, users };
+  const [lk, users, assets] = await Promise.all([getLookups(), getUsers(), getAssets()]);
+  return { lk, users, assets };
 }
 
 function snippet(text, max = 240) {
@@ -50,7 +51,7 @@ function formatBirthday(value) {
 
 // Danh sách thành viên: tìm theo tên (không phân biệt dấu), lọc nhóm, sắp xếp.
 usersRouter.get('/', async (req, res) => {
-  const { lk, users } = await context();
+  const { lk, users, assets } = await context();
   const term = fold(String(req.query.q || '').trim());
   const group = toInt(req.query.group);
   const sort = Object.hasOwn(SORTS, req.query.sort) ? req.query.sort : 'posts';
@@ -73,20 +74,20 @@ usersRouter.get('/', async (req, res) => {
     pages,
     sort,
     groups,
-    users: list.slice(offset, offset + LIST_PER_PAGE).map((u) => userBrief(lk, u)),
+    users: list.slice(offset, offset + LIST_PER_PAGE).map((u) => userBrief(lk, u, assets)),
   });
 });
 
 // Hồ sơ đầy đủ (trừ mật khẩu, salt, IP).
 usersRouter.get('/:id', async (req, res) => {
-  const { lk, users } = await context();
+  const { lk, users, assets } = await context();
   const id = toInt(req.params.id);
   const rows = await q(
     `SELECT userid, username, usergroupid, membergroupids, displaygroupid, email, homepage,
             icq, aim, yahoo, msn, skype, fbname, usertitle, joindate, lastvisit, lastactivity,
             lastpost, lastpostid, posts, reputation, birthday, referrerid, profilevisits, friendcount,
             infractions, warnings, post_thanks_user_amount, post_thanks_thanked_posts,
-            post_thanks_thanked_times, timespentonline, dbtech_status_status
+            post_thanks_thanked_times, timespentonline, dbtech_status_status, avatarid
        FROM user WHERE userid = ?`,
     [id],
   );
@@ -137,6 +138,8 @@ usersRouter.get('/:id', async (req, res) => {
       id: u.userid,
       username: clean(u.username),
       color: group?.color || null,
+      avatar: avatarUrl(assets, u.userid, u.avatarid),
+      profilePic: profilePicUrl(assets, u.userid),
       title: clean(u.usertitle),
       group: group?.title || null,
       groups: groupIds.map((g) => lk.groups.get(g)?.title).filter(Boolean),
@@ -333,7 +336,7 @@ usersRouter.get('/:id/posts', async (req, res) => {
 
 // Bạn bè, danh sách liên hệ, và những người hay cảm ơn qua lại.
 usersRouter.get('/:id/friends', async (req, res) => {
-  const { lk, users } = await context();
+  const { lk, users, assets } = await context();
   const id = toInt(req.params.id);
   const [relations, thankedBy, thanked] = await Promise.all([
     q("SELECT relationid, friend FROM userlist WHERE userid = ? AND type = 'buddy'", [id]),
@@ -348,7 +351,7 @@ usersRouter.get('/:id/friends', async (req, res) => {
   ]);
   const brief = (uid) => {
     const u = users.byId.get(uid);
-    return u ? userBrief(lk, u) : { id: uid, username: `#${uid}`, color: null };
+    return u ? userBrief(lk, u, assets) : { id: uid, username: `#${uid}`, color: null, avatar: null };
   };
   const byName = (x, y) => x.username.localeCompare(y.username, 'vi');
   res.json({

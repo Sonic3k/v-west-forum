@@ -1,47 +1,46 @@
 import { Router } from 'express';
 import { q } from '../db.js';
 import { getLookups, breadcrumb, mapThread, mapUser, THREAD_COLS } from '../lookups.js';
+import { avatarUrl, getAssets } from '../assets.js';
 import { clean, toInt } from '../text.js';
 
 export const threadsRouter = Router();
 export const postsRouter = Router();
 
 export const POSTS_PER_PAGE = 20;
+const EXPORT_LIMIT = 5000;
 const IMAGE_EXT = new Set(['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp']);
 
-threadsRouter.get('/:id', async (req, res) => {
-  const lk = await getLookups();
-  const id = toInt(req.params.id);
+async function loadThread(lk, id) {
   const rows = await q(`SELECT ${THREAD_COLS} FROM thread WHERE threadid = ?`, [id]);
-  if (!rows.length) {
-    res.status(404).json({ error: 'Không tìm thấy chủ đề này.' });
-    return;
-  }
-  const thread = mapThread(lk, rows[0]);
-  if (thread.movedTo) {
-    res.json({ redirect: thread.movedTo });
-    return;
-  }
+  return rows.length ? { row: rows[0], thread: mapThread(lk, rows[0]) } : null;
+}
 
-  const [{ n: total }] = await q('SELECT COUNT(*) AS n FROM post WHERE threadid = ?', [id]);
-  const pages = Math.max(1, Math.ceil(total / POSTS_PER_PAGE));
-  const page = Math.min(Math.max(toInt(req.query.page) || 1, 1), pages);
-  const offset = (page - 1) * POSTS_PER_PAGE;
+function threadEnvelope(lk, thread) {
+  const forum = lk.forums.get(thread.forumId);
+  return {
+    thread,
+    forum: forum ? { id: forum.id, title: forum.title } : null,
+    breadcrumb: forum ? [...breadcrumb(lk, forum.id), { id: forum.id, title: forum.title }] : [],
+  };
+}
 
+// Bài viết của một chủ đề kèm người viết, chữ ký, đính kèm, cảm ơn, bình luận.
+async function loadPosts(lk, threadId, offset, limit) {
   const postRows = await q(
     `SELECT postid, parentid, username, userid, title, dateline, pagetext, visible, attach, showsignature
        FROM post
       WHERE threadid = ?
       ORDER BY dateline, postid
       LIMIT ? OFFSET ?`,
-    [id, POSTS_PER_PAGE, offset],
+    [threadId, limit, offset],
   );
-
   const postIds = postRows.map((p) => p.postid);
   const userIds = [...new Set(postRows.map((p) => p.userid).filter((uid) => uid > 0))];
-  const [users, signatures, attachments, thanks, comments, poll] = await Promise.all([
+  const [assets, users, signatures, attachments, thanks, comments] = await Promise.all([
+    getAssets(),
     userIds.length
-      ? q(`SELECT userid, username, usertitle, joindate, posts, usergroupid, displaygroupid, reputation
+      ? q(`SELECT userid, username, usertitle, joindate, posts, usergroupid, displaygroupid, reputation, avatarid
              FROM user WHERE userid IN (?)`, [userIds])
       : [],
     userIds.length
@@ -58,16 +57,15 @@ threadsRouter.get('/:id', async (req, res) => {
             WHERE c.postid IN (?)
             ORDER BY c.dateline, c.id`, [postIds]).catch(() => [])
       : [],
-    rows[0].pollid > 0 ? loadPoll(rows[0].pollid) : null,
   ]);
 
-  const userMap = new Map(users.map((u) => [u.userid, mapUser(lk, u)]));
+  const userMap = new Map(users.map((u) => [u.userid, { ...mapUser(lk, u), avatar: avatarUrl(assets, u.userid, u.avatarid) }]));
   const sigMap = new Map(signatures.map((s) => [s.userid, s.signature || '']));
   const thanksBy = groupBy(thanks, (t) => t.postid);
   const commentsBy = groupBy(comments, (c) => c.postid);
   const attachBy = groupBy(attachments, (a) => a.postId);
 
-  const posts = postRows.map((p, i) => ({
+  return postRows.map((p, i) => ({
     id: p.postid,
     number: offset + i + 1,
     dateline: p.dateline,
@@ -85,18 +83,48 @@ threadsRouter.get('/:id', async (req, res) => {
       id: c.id, userId: c.userid, username: clean(c.username) || `#${c.userid}`, text: c.comment || '', dateline: c.dateline,
     })),
   }));
+}
 
-  const forum = lk.forums.get(thread.forumId);
-  res.json({
-    thread,
-    forum: forum ? { id: forum.id, title: forum.title } : null,
-    breadcrumb: forum ? [...breadcrumb(lk, forum.id), { id: forum.id, title: forum.title }] : [],
-    poll,
-    page,
-    pages,
-    total,
-    posts,
-  });
+threadsRouter.get('/:id', async (req, res) => {
+  const lk = await getLookups();
+  const found = await loadThread(lk, toInt(req.params.id));
+  if (!found) {
+    res.status(404).json({ error: 'Không tìm thấy chủ đề này.' });
+    return;
+  }
+  const { row, thread } = found;
+  if (thread.movedTo) {
+    res.json({ redirect: thread.movedTo });
+    return;
+  }
+  const [{ n: total }] = await q('SELECT COUNT(*) AS n FROM post WHERE threadid = ?', [thread.id]);
+  const pages = Math.max(1, Math.ceil(total / POSTS_PER_PAGE));
+  const page = Math.min(Math.max(toInt(req.query.page) || 1, 1), pages);
+  const [posts, poll] = await Promise.all([
+    loadPosts(lk, thread.id, (page - 1) * POSTS_PER_PAGE, POSTS_PER_PAGE),
+    row.pollid > 0 ? loadPoll(row.pollid) : null,
+  ]);
+  res.json({ ...threadEnvelope(lk, thread), poll, page, pages, total, posts });
+});
+
+// Toàn bộ chủ đề trong một lần (dùng cho trang xuất file).
+threadsRouter.get('/:id/all', async (req, res) => {
+  const lk = await getLookups();
+  const found = await loadThread(lk, toInt(req.params.id));
+  if (!found) {
+    res.status(404).json({ error: 'Không tìm thấy chủ đề này.' });
+    return;
+  }
+  const { row, thread } = found;
+  if (thread.movedTo) {
+    res.json({ redirect: thread.movedTo });
+    return;
+  }
+  const [posts, poll] = await Promise.all([
+    loadPosts(lk, thread.id, 0, EXPORT_LIMIT),
+    row.pollid > 0 ? loadPoll(row.pollid) : null,
+  ]);
+  res.json({ ...threadEnvelope(lk, thread), poll, total: posts.length, posts });
 });
 
 // Tìm chủ đề và trang chứa một bài viết (dùng cho link "bài mới nhất", trích dẫn...).

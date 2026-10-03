@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { useApi } from '../lib/api.js';
 import { formatDate, formatDay, formatNumber } from '../lib/format.js';
-import { Pagination, Status, UserLink } from '../components/ui.jsx';
+import { Avatar, Pagination, Status, UserLink } from '../components/ui.jsx';
 
 const SORTS = [
   ['posts', 'Nhiều bài nhất'],
@@ -91,6 +91,7 @@ export default function Members() {
           <ul className="mlist">
             {data.users.map((u) => (
               <li key={u.id} className="mrow">
+                <Avatar src={u.avatar} name={u.username} size="sm" />
                 <div className="mrow-main">
                   <UserLink id={u.id} name={u.username} color={u.color} className="mrow-name" />
                   <span className="muted mrow-sub">{[u.title, u.group].filter(Boolean).join(', ')}</span>

@@ -7,6 +7,9 @@ import { forumsRouter } from './routes/forums.js';
 import { threadsRouter, postsRouter } from './routes/threads.js';
 import { attachmentsRouter } from './routes/attachments.js';
 import { usersRouter } from './routes/users.js';
+import { searchRouter } from './routes/search.js';
+import { assetsRouter, avatarsRouter, smiliesRouter } from './routes/assets.js';
+import { startSearchIndex } from './searchIndex.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const webDist = process.env.WEB_DIST || path.resolve(here, '../../web/dist');
@@ -37,6 +40,10 @@ app.use('/api/threads', threadsRouter);
 app.use('/api/posts', postsRouter);
 app.use('/api/attachments', attachmentsRouter);
 app.use('/api/users', usersRouter);
+app.use('/api/search', searchRouter);
+app.use('/api/assets', assetsRouter);
+app.use('/api/avatars', avatarsRouter);
+app.use('/api/smilies', smiliesRouter);
 app.use('/api', (req, res) => res.status(404).json({ error: 'Không có API này.' }));
 
 app.use('/assets', express.static(path.join(webDist, 'assets'), { immutable: true, maxAge: '1y' }));
@@ -60,4 +67,8 @@ app.use((err, req, res, next) => {
 });
 
 const port = Number(process.env.PORT) || 8080;
-app.listen(port, () => console.log(`V-Westlife panel đang chạy ở cổng ${port}`));
+app.listen(port, () => {
+  console.log(`V-Westlife panel đang chạy ở cổng ${port}`);
+  // Dựng chỉ mục tìm kiếm chạy nền (chỉ lần đầu hoặc khi dữ liệu đổi).
+  startSearchIndex();
+});

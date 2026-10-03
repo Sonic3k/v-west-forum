@@ -3,7 +3,7 @@ import { Link, useParams, useSearchParams } from 'react-router-dom';
 import { useApi } from '../lib/api.js';
 import { formatDate, formatDay, formatNumber } from '../lib/format.js';
 import BBCode from '../components/BBCode.jsx';
-import { Label, Pagination, Status, Tabs, ThreadRow, UserLink } from '../components/ui.jsx';
+import { Avatar, Label, Pagination, Status, Tabs, ThreadRow, UserLink } from '../components/ui.jsx';
 
 const TABS = ['profile', 'wall', 'pm', 'threads', 'posts', 'friends'];
 
@@ -22,9 +22,12 @@ export default function Member() {
         <Link to="/u">Thành viên</Link>
       </nav>
       <header className="member-head">
-        <h1 className="page-title member-name" style={user.color ? { color: user.color } : undefined}>
-          {user.username}
-        </h1>
+        <div className="member-top">
+          <Avatar src={user.avatar} name={user.username} size="lg" />
+          <h1 className="page-title member-name" style={user.color ? { color: user.color } : undefined}>
+            {user.username}
+          </h1>
+        </div>
         <p className="member-roles">
           {user.title && <span className="member-title">{user.title}</span>}
           {user.groups.length > 0 && <span className="muted">{user.groups.join(', ')}</span>}
@@ -133,6 +136,13 @@ function ProfileTab({ data }) {
               <li key={f.id}>{f.id > 0 ? <Link to={`/f/${f.id}`}>{f.title}</Link> : f.title}</li>
             ))}
           </ul>
+        </section>
+      )}
+
+      {user.profilePic && (
+        <section className="profile-block">
+          <h2 className="block-title">Ảnh hồ sơ</h2>
+          <img className="profile-pic" src={user.profilePic} alt={`Ảnh hồ sơ của ${user.username}`} loading="lazy" />
         </section>
       )}
 

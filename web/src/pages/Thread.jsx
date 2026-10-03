@@ -1,10 +1,10 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Navigate, useLocation, useParams, useSearchParams } from 'react-router-dom';
+import { Link, Navigate, useLocation, useParams, useSearchParams } from 'react-router-dom';
 import { useApi } from '../lib/api.js';
 import { parseBBCode, collectAttachIds } from '../lib/bbcode.js';
 import { formatDate, formatDay, formatNumber, formatSize } from '../lib/format.js';
 import BBCode from '../components/BBCode.jsx';
-import { Breadcrumb, Label, Pagination, Status, UserLink, UserList } from '../components/ui.jsx';
+import { Avatar, Breadcrumb, Label, Pagination, Status, UserLink, UserList } from '../components/ui.jsx';
 
 export default function Thread() {
   const { id } = useParams();
@@ -48,6 +48,9 @@ export default function Thread() {
         {thread.visible === 0 && <Label tone="warn">Chờ duyệt</Label>}
         {thread.visible === 2 && <Label tone="danger">Đã xóa</Label>}
       </p>
+      <p className="page-actions">
+        <Link to={`/t/${id}/export`}>Tải cả chủ đề về máy</Link>
+      </p>
 
       {data.poll && <Poll poll={data.poll} />}
 
@@ -76,6 +79,7 @@ function Post({ post, attachments }) {
       </header>
       <div className="post-grid">
         <aside className="author">
+          <Avatar src={author?.avatar} name={author?.username || post.username} />
           <UserLink id={author?.id} name={author?.username || post.username} color={author?.color} />
           {author ? (
             <>

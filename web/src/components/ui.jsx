@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { Link } from 'react-router-dom';
 import BBCode from './BBCode.jsx';
 import { formatDate, formatNumber } from '../lib/format.js';
@@ -62,6 +62,24 @@ export function Pagination({ page, pages, hrefFor }) {
         ? <Link to={hrefFor(page + 1)} className="pager-step">Sau</Link>
         : <span className="pager-step pager-off">Sau</span>}
     </nav>
+  );
+}
+
+// Avatar; chưa có ảnh (hoặc ảnh lỗi) thì hiện chữ cái đầu của tên.
+export function Avatar({ src, name, size = 'md' }) {
+  const [broken, setBroken] = useState(false);
+  const initial = (name || '?').trim().charAt(0).toUpperCase() || '?';
+  if (!src || broken) {
+    return <span className={`avatar avatar-${size} avatar-empty`} aria-hidden="true">{initial}</span>;
+  }
+  return (
+    <img
+      className={`avatar avatar-${size}`}
+      src={src}
+      alt=""
+      loading="lazy"
+      onError={() => setBroken(true)}
+    />
   );
 }
 

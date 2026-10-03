@@ -9,3 +9,16 @@ Node (Express) + React (Vite), deploy trên Railway bằng `Dockerfile`.
 - `PANEL_PASSWORD` (tùy chọn): đặt thì trình duyệt sẽ hỏi mật khẩu trước khi vào panel.
 
 Kiểm tra kết nối database: mở `/api/health/db`.
+
+## Nhập avatar và smilie (chạy một lần trên máy)
+
+Ảnh nằm trong bộ source forum (đã giải nén), không có trong database. Cần bật TCP Proxy của MySQL trong lúc chạy:
+
+```powershell
+cd server
+npm install
+$env:DATABASE_URL = "mysql://root:<password>@<host>:<port>/railway"
+node tools/import-assets.js "E:\FC Westlife\4rum VW"
+```
+
+Panel tự tạo thêm bảng `panel_post_search`, `panel_meta` (tìm kiếm) và dùng bảng `panel_asset` (ảnh); bảng gốc của vBulletin không bị sửa.
