@@ -1,24 +1,29 @@
-# V-Westlife – kho lưu trữ diễn đàn
+# V-Westlife forum archive
 
-Panel chỉ đọc cho database vBulletin 4 của diễn đàn V-Westlife (bản sao lưu 11/12/2012).
-Node (Express) + React (Vite), deploy trên Railway bằng `Dockerfile`.
+Read-only panel for the vBulletin 4 database of the V-Westlife forum (backup from 2012-12-11).
+Node (Express) + React (Vite), deployed on Railway with the `Dockerfile`. The UI is in Vietnamese.
 
-## Biến môi trường
+## Environment variables
 
-- `DATABASE_URL` (bắt buộc): đặt bằng `${{MySQL.MYSQL_URL}}` để dùng mạng nội bộ của Railway.
-- `PANEL_PASSWORD` (tùy chọn): đặt thì trình duyệt sẽ hỏi mật khẩu trước khi vào panel.
+- `DATABASE_URL` (required): set to `${{MySQL.MYSQL_URL}}` to use Railway's private network.
+- `PANEL_PASSWORD` (optional): when set, the browser asks for a password before opening the panel.
 
-Kiểm tra kết nối database: mở `/api/health/db`.
+Database connection check: open `/api/health/db`.
 
-## Nhập avatar và smilie (chạy một lần trên máy)
+The panel only adds its own tables (`panel_post_search`, `panel_meta`, `panel_asset`); vBulletin tables are never modified.
 
-Ảnh nằm trong bộ source forum (đã giải nén), không có trong database. Script nhập avatar, ảnh hồ sơ, ảnh chữ ký, smilie (gồm các bộ rabbit, onion...) và avatar có sẵn. Cần bật TCP Proxy của MySQL trong lúc chạy:
+## Tools (run locally, PowerShell, inside `server/`)
+
+The MySQL TCP proxy must be enabled while a tool reads or writes the database.
 
 ```powershell
-cd server
 npm install
 $env:DATABASE_URL = "mysql://root:<password>@<host>:<port>/railway"
-node tools/import-assets.js "E:\FC Westlife\4rum VW\forum\forum"
-```
 
-Panel tự tạo thêm bảng `panel_post_search`, `panel_meta` (tìm kiếm) và dùng bảng `panel_asset` (ảnh); bảng gốc của vBulletin không bị sửa.
+# Avatars, profile pictures, signature pictures, smilies (rabbit, onion, ...) and stock avatars
+node tools/import-assets.js "E:\FC Westlife\4rum VW\forum\forum"
+
+# Rescue hotlinked images (Photobucket, ...) into a local folder grouped by provider
+node tools/rescue-images.js --out "E:\FC Westlife\external-images"
+node tools/rescue-images.js --out "E:\FC Westlife\external-images" --wayback
+```

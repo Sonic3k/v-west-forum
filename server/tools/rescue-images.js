@@ -1,35 +1,46 @@
-// Cứu ảnh từ các dịch vụ ngoài (Photobucket, Blogspot, Flickr...) được nhúng bằng [IMG] trong forum.
-// Chỉ ĐỌC database; ảnh được lưu vào thư mục trên máy bạn. Chạy lại bao nhiêu lần cũng được:
-// link đã xử lý sẽ được bỏ qua (ghi trong manifest.jsonl).
+// Rescue externally hosted images (Photobucket, Blogspot, Flickr, ...) embedded with [IMG] in the forum.
+// Reads the database only; images are saved to a local folder, grouped by provider:
+//   <out>/images/<provider>/<host>/<original path>      e.g. images/photobucket/i123.photobucket.com/albums/...
+//   <out>/_suspected-placeholders/                        one copy of each image that looks like a "not available" banner
+//   <out>/urls.json        all image links found in the database (so later runs do not need the database)
+//   <out>/manifest.jsonl   one line per processed link; used to resume and to publish later
+//   <out>/index.csv        spreadsheet-friendly list: url, provider, host, status, origin, file, bytes, refs
 //
-// PowerShell, trong thư mục server, cần bật TCP Proxy của MySQL ở lần chạy đầu:
+// Usage (PowerShell, inside the server folder; the first run needs the MySQL TCP proxy):
 //   $env:DATABASE_URL = "mysql://root:<password>@<host>:<port>/railway"
-//   node tools/rescue-images.js --out "E:\FC Westlife\anh-ngoai" --host photobucket --sample 50   (tải thử)
-//   node tools/rescue-images.js --out "E:\FC Westlife\anh-ngoai"                                  (tải hết)
-//   node tools/rescue-images.js --out "E:\FC Westlife\anh-ngoai" --wayback                        (thử Wayback cho link chết)
+//   node tools/rescue-images.js --out "E:\FC Westlife\external-images" --provider photobucket --sample 50
+//   node tools/rescue-images.js --out "E:\FC Westlife\external-images"
+//   node tools/rescue-images.js --out "E:\FC Westlife\external-images" --wayback
 //
-// Tùy chọn: --host <chuỗi>  chỉ xử lý link có host chứa chuỗi này
-//           --sample <n>    chỉ thử n link (rải đều trong danh sách)
-//           --concurrency <n> số link tải cùng lúc (mặc định 4)
-//           --rescan        đọc lại danh sách link từ database
+// Options: --provider <name>   only links from this provider (photobucket, facebook, google, ...)
+//          --host <text>       only links whose host contains this text
+//          --sample <n>        only try n links, spread evenly over the list
+//          --concurrency <n>   parallel downloads (default 4)
+//          --wayback           retry dead links through the Internet Archive Wayback Machine
+//          --rescan            read the link list from the database again
+// Safe to re-run at any time: finished links are skipped, interrupted runs continue where they stopped.
 import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import mysql from 'mysql2/promise';
+import { providerOf } from '../src/providers.js';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
 const TIMEOUT_MS = 30000;
-const SUSPECT_MIN_URLS = 8; // cùng một nội dung ảnh xuất hiện ở >= 8 link khác nhau → nghi là ảnh báo lỗi
+const SUSPECT_MIN_URLS = 8; // identical bytes behind >= 8 different links => most likely a placeholder banner
 const FINAL = new Set(['ok', 'not_found', 'suspect']);
+const IMAGES_DIR = 'images';
+const SUSPECT_DIR = '_suspected-placeholders';
 
-// ---------- tham số ----------
+// ---------- arguments ----------
 function parseArgs(argv) {
-  const opts = { out: null, host: null, sample: 0, concurrency: 4, wayback: false, rescan: false };
+  const opts = { out: null, host: null, provider: null, sample: 0, concurrency: 4, wayback: false, rescan: false };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--out') opts.out = argv[++i];
     else if (a === '--host') opts.host = String(argv[++i] || '').toLowerCase();
+    else if (a === '--provider') opts.provider = String(argv[++i] || '').toLowerCase();
     else if (a === '--sample') opts.sample = Number(argv[++i]) || 0;
     else if (a === '--concurrency') opts.concurrency = Math.max(1, Math.min(16, Number(argv[++i]) || 4));
     else if (a === '--wayback') opts.wayback = true;
@@ -38,7 +49,8 @@ function parseArgs(argv) {
   return opts;
 }
 
-// ---------- đọc link từ database ----------
+// ---------- read links from the database ----------
+// The vBulletin tables are latin1 but hold UTF-8 bytes: read raw bytes and decode as UTF-8.
 const TEXT_TYPES = new Set(['VAR_STRING', 'STRING', 'VARCHAR', 'BLOB', 'TINY_BLOB', 'MEDIUM_BLOB', 'LONG_BLOB']);
 const utf8Cast = (field, next) => {
   if (TEXT_TYPES.has(field.type)) {
@@ -57,27 +69,27 @@ const decodeEntities = (s) => s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (m, c) 
   return ENTITIES[c.toLowerCase()] ?? m;
 });
 
-// [tên, bảng, cột chứa nội dung]
+// [label, table, text column]
 const SOURCES = [
-  ['bai viet', 'post', 'pagetext'],
-  ['chu ky', 'usertextfield', 'signature'],
-  ['tuong', 'visitormessage', 'pagetext'],
-  ['tin nhan', 'pmtext', 'message'],
-  ['binh luan', 'vbcomment', 'comment'],
-  ['thong bao', 'announcement', 'pagetext'],
+  ['posts', 'post', 'pagetext'],
+  ['signatures', 'usertextfield', 'signature'],
+  ['wall messages', 'visitormessage', 'pagetext'],
+  ['private messages', 'pmtext', 'message'],
+  ['post comments', 'vbcomment', 'comment'],
+  ['announcements', 'announcement', 'pagetext'],
 ];
 
 async function scanDatabase(uri) {
   const db = await mysql.createConnection({ uri, charset: 'BINARY', typeCast: utf8Cast });
   const urls = new Map();
   const IMG = /\[img(?:=[^\]]*)?\]\s*([\s\S]*?)\s*\[\/img\]/gi;
-  for (const [kind, table, column] of SOURCES) {
+  for (const [label, table, column] of SOURCES) {
     let rows = [];
     try {
-      // Kết nối BINARY nên so sánh phân biệt hoa thường: dùng LOWER để bắt cả [IMG] lẫn [img].
+      // BINARY connection compares case-sensitively: LOWER() catches both [IMG] and [img].
       [rows] = await db.query(`SELECT ${column} AS t FROM ${table} WHERE LOWER(${column}) LIKE '%[img%'`);
     } catch (err) {
-      console.log(`  (bỏ qua ${kind}: ${err.code || err.message})`);
+      console.log(`  (skipped ${label}: ${err.code || err.message})`);
       continue;
     }
     let found = 0;
@@ -91,21 +103,21 @@ async function scanDatabase(uri) {
         } catch {
           continue;
         }
-        if (/westlife/.test(host)) continue; // ảnh trên chính forum cũ: đã có trong database/ảnh đã nhập
-        const item = urls.get(url) || { url, host, refs: 0, kinds: [] };
+        if (/westlife/.test(host)) continue; // the old forum itself: covered by the database and imported assets
+        const item = urls.get(url) || { url, host, provider: providerOf(host), refs: 0, usedIn: [] };
         item.refs += 1;
-        if (!item.kinds.includes(kind)) item.kinds.push(kind);
+        if (!item.usedIn.includes(label)) item.usedIn.push(label);
         urls.set(url, item);
         found += 1;
       }
     }
-    console.log(`  ${kind}: ${rows.length} mục có [IMG], ${found} link`);
+    console.log(`  ${label}: ${rows.length} items with [IMG], ${found} links`);
   }
   await db.end();
   return [...urls.values()];
 }
 
-// ---------- tải ảnh ----------
+// ---------- download ----------
 function sniff(buf) {
   if (!buf || buf.length < 12) return null;
   if (buf.toString('latin1', 0, 3) === 'GIF') return 'gif';
@@ -134,14 +146,14 @@ async function fetchBytes(url) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Tải một địa chỉ, thử lại khi lỗi mạng hoặc bị giới hạn tốc độ.
+// One address, retried on network errors and rate limiting.
 async function attempt(target) {
-  let last = { status: 'error', detail: 'không tải được' };
+  let last = { status: 'error', detail: 'download failed' };
   for (let i = 0; i < 2; i += 1) {
     try {
       const r = await fetchBytes(target);
       if (r.status === 429 || r.status === 503) {
-        last = { status: `http_${r.status}`, detail: 'bị giới hạn tốc độ' };
+        last = { status: `http_${r.status}`, detail: 'rate limited' };
         await sleep(20000);
         continue;
       }
@@ -151,14 +163,14 @@ async function attempt(target) {
       if (!ext) return { status: 'not_image', finalUrl: r.finalUrl, bytes: r.buf.length };
       return { status: 'ok', ext, buf: r.buf, finalUrl: r.finalUrl };
     } catch (err) {
-      last = { status: 'error', detail: err.name === 'AbortError' ? 'quá thời gian' : (err.cause?.code || err.message) };
+      last = { status: 'error', detail: err.name === 'AbortError' ? 'timeout' : (err.cause?.code || err.message) };
       await sleep(1500);
     }
   }
   return last;
 }
 
-// Thử link gốc; chỉ thử bản https khi link http lỗi mạng (máy chủ không trả lời).
+// Original link first; the https variant only when the http link got no answer at all.
 async function tryDownload(url) {
   const candidates = [url];
   if (url.startsWith('http://')) candidates.push(`https://${url.slice(7)}`);
@@ -186,28 +198,49 @@ async function waybackDownload(url) {
   }
 }
 
-// ---------- lưu file ----------
-const BAD = /[<>:"|?*\u0000-\u001f]/g;
+// ---------- local files ----------
+const BAD_CHARS = /[<>:"|?*\u0000-\u001f]/g;
 
+// images/<provider>/<host>/<path>; very long paths go to images/<provider>/_long-paths/<hash>.<ext>
 function localPath(out, url, ext) {
   const u = new URL(url);
+  const host = u.hostname.toLowerCase();
+  const provider = providerOf(host);
   let parts = u.pathname.split('/').filter(Boolean).map((p) => {
     let s = p;
     try {
       s = decodeURIComponent(p);
     } catch {
-      // giữ nguyên
+      // keep as is
     }
-    return s.replace(BAD, '_').replace(/[. ]+$/, '_').slice(0, 120) || '_';
+    return s.replace(BAD_CHARS, '_').replace(/[. ]+$/, '_').slice(0, 120) || '_';
   });
   if (!parts.length) parts = ['index'];
   let name = parts.pop();
   const hash = crypto.createHash('sha1').update(url).digest('hex').slice(0, 8);
   if (u.search) name = `${name}__${hash}`;
   if (!new RegExp(`\\.(${ext}|jpe?g)$`, 'i').test(name)) name = `${name}.${ext}`;
-  let full = path.join(out, 'files', u.hostname.toLowerCase(), ...parts, name);
-  if (full.length > 230) full = path.join(out, 'files', u.hostname.toLowerCase(), '_dai', `${hash}.${ext}`);
+  let full = path.join(out, IMAGES_DIR, provider, host, ...parts, name);
+  if (full.length > 230) full = path.join(out, IMAGES_DIR, provider, '_long-paths', `${hash}.${ext}`);
   return full;
+}
+
+async function removeEmptyDirs(dir) {
+  if (!existsSync(dir)) return;
+  for (const e of await fs.readdir(dir, { withFileTypes: true })) {
+    if (e.isDirectory()) await removeEmptyDirs(path.join(dir, e.name));
+  }
+  if ((await fs.readdir(dir)).length === 0) await fs.rmdir(dir);
+}
+
+async function moveFile(from, to) {
+  await fs.mkdir(path.dirname(to), { recursive: true });
+  try {
+    await fs.rename(from, to);
+  } catch {
+    await fs.copyFile(from, to);
+    await fs.rm(from, { force: true });
+  }
 }
 
 // ---------- manifest ----------
@@ -221,14 +254,44 @@ async function readManifest(file) {
       const rec = JSON.parse(line);
       map.set(rec.url, { ...(map.get(rec.url) || {}), ...rec });
     } catch {
-      // bỏ dòng hỏng
+      // ignore broken line
     }
   }
   return map;
 }
 
-// Cùng một nội dung ảnh ở rất nhiều link khác nhau → nhiều khả năng là ảnh báo lỗi của dịch vụ.
-// Giữ đúng 1 bản trong _nghi-van để bạn tự xem, đánh dấu các link đó là "suspect".
+// Files saved by the first version of this tool (files/<host>/..., _nghi-van/) are moved to the new layout.
+async function migrateLayout(out, manifest, manifestFile) {
+  const lines = [];
+  const moved = new Map();
+  for (const rec of manifest.values()) {
+    if (!rec.file) continue;
+    const oldRel = rec.file;
+    let newRel = null;
+    if (rec.status === 'ok' && /^files[\\/]/.test(oldRel) && rec.ext) {
+      newRel = path.relative(out, localPath(out, rec.url, rec.ext));
+    } else if (rec.status === 'suspect' && /^_nghi-van[\\/]/.test(oldRel)) {
+      newRel = path.join(SUSPECT_DIR, path.basename(oldRel));
+    }
+    if (!newRel || newRel === oldRel) continue;
+    const from = path.join(out, oldRel);
+    if (!moved.has(oldRel) && existsSync(from)) {
+      await moveFile(from, path.join(out, newRel));
+      moved.set(oldRel, newRel);
+    }
+    rec.file = newRel;
+    lines.push(JSON.stringify({ url: rec.url, file: newRel, at: new Date().toISOString() }));
+  }
+  if (lines.length) {
+    await fs.appendFile(manifestFile, `${lines.join('\n')}\n`);
+    await removeEmptyDirs(path.join(out, 'files'));
+    await removeEmptyDirs(path.join(out, '_nghi-van'));
+    console.log(`Moved ${moved.size} files from the old folder layout to ${IMAGES_DIR}/<provider>/...`);
+  }
+}
+
+// Same bytes behind many different links => most likely the provider's "image not available" banner.
+// Keep exactly one copy in _suspected-placeholders for review and mark those links as "suspect".
 async function markSuspects(out, manifest, manifestFile) {
   const byHash = new Map();
   for (const rec of manifest.values()) {
@@ -241,7 +304,8 @@ async function markSuspects(out, manifest, manifestFile) {
   const report = [];
   for (const [hash, list] of byHash) {
     if (list.length < SUSPECT_MIN_URLS) continue;
-    const keep = path.join(out, '_nghi-van', `${hash.slice(0, 12)}.${list[0].ext || 'img'}`);
+    const provider = providerOf(new URL(list[0].url).hostname);
+    const keep = path.join(out, SUSPECT_DIR, `${provider}-${hash.slice(0, 12)}.${list[0].ext || 'img'}`);
     await fs.mkdir(path.dirname(keep), { recursive: true });
     for (const rec of list) {
       const src = rec.file ? path.join(out, rec.file) : null;
@@ -253,17 +317,74 @@ async function markSuspects(out, manifest, manifestFile) {
       manifest.set(rec.url, { ...rec, ...next });
       lines.push(JSON.stringify(next));
     }
-    report.push({ file: path.relative(out, keep), urls: list.length, bytes: list[0].bytes, example: list[0].url });
+    report.push({ file: path.relative(out, keep), urls: list.length, bytes: list[0].bytes });
   }
   if (lines.length) await fs.appendFile(manifestFile, `${lines.join('\n')}\n`);
   return report;
 }
 
-// ---------- chạy ----------
+// ---------- reports ----------
+// Labels written by the first version of this tool.
+const OLD_LABELS = {
+  'bai viet': 'posts', 'chu ky': 'signatures', tuong: 'wall messages',
+  'tin nhan': 'private messages', 'binh luan': 'post comments', 'thong bao': 'announcements',
+};
+
+const csvCell = (v) => {
+  const s = v == null ? '' : String(v);
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+
+async function writeIndex(out, all, manifest) {
+  const header = ['url', 'provider', 'host', 'status', 'origin', 'file', 'bytes', 'refs', 'used_in', 'wayback'];
+  const rows = [header.join(',')];
+  for (const item of all) {
+    const rec = manifest.get(item.url) || {};
+    const origin = rec.status === 'ok' ? (String(rec.source || '').startsWith('wayback') ? 'wayback' : 'direct') : '';
+    const status = rec.status === 'suspect' ? 'suspected_placeholder' : (rec.status || 'pending');
+    rows.push([
+      item.url, item.provider || providerOf(item.host), item.host, status, origin,
+      (rec.file || '').split(path.sep).join('/'), rec.bytes || '', item.refs,
+      (item.usedIn || item.kinds || []).map((k) => OLD_LABELS[k] || k).join('; '), rec.wayback || '',
+    ].map(csvCell).join(','));
+  }
+  // BOM so Excel opens the file as UTF-8.
+  await fs.writeFile(path.join(out, 'index.csv'), `\uFEFF${rows.join('\r\n')}\r\n`, 'utf8');
+}
+
+function printSummary(all, manifest, out) {
+  const byProvider = new Map();
+  for (const item of all) {
+    const p = item.provider || providerOf(item.host);
+    const row = byProvider.get(p) || { links: 0, ok: 0, wayback: 0, dead: 0, pending: 0, bytes: 0 };
+    const rec = manifest.get(item.url);
+    row.links += 1;
+    if (!rec || !rec.status) row.pending += 1;
+    else if (rec.status === 'ok') {
+      row.ok += 1;
+      row.bytes += rec.bytes || 0;
+      if (String(rec.source || '').startsWith('wayback')) row.wayback += 1;
+    } else row.dead += 1;
+    byProvider.set(p, row);
+  }
+  const rows = [...byProvider.entries()].sort((a, b) => b[1].links - a[1].links);
+  console.log('\nProvider        links      saved  (wayback) not saved   pending        MB');
+  let total = { links: 0, ok: 0, wayback: 0, dead: 0, pending: 0, bytes: 0 };
+  for (const [p, r] of rows) {
+    console.log(`${p.padEnd(14)}${String(r.links).padStart(7)}${String(r.ok).padStart(11)}${String(r.wayback).padStart(11)}`
+      + `${String(r.dead).padStart(10)}${String(r.pending).padStart(10)}${(r.bytes / 1048576).toFixed(1).padStart(10)}`);
+    for (const k of Object.keys(total)) total[k] += r[k];
+  }
+  console.log(`${'TOTAL'.padEnd(14)}${String(total.links).padStart(7)}${String(total.ok).padStart(11)}${String(total.wayback).padStart(11)}`
+    + `${String(total.dead).padStart(10)}${String(total.pending).padStart(10)}${(total.bytes / 1048576).toFixed(1).padStart(10)}`);
+  console.log(`Images: ${path.join(out, IMAGES_DIR)}   List: ${path.join(out, 'index.csv')}`);
+}
+
+// ---------- main ----------
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   if (!opts.out) {
-    console.log('Thiếu --out "<thư mục lưu ảnh>". Xem hướng dẫn ở đầu file tools/rescue-images.js.');
+    console.log('Missing --out "<folder>". See the usage notes at the top of tools/rescue-images.js.');
     process.exit(1);
   }
   const out = path.resolve(opts.out);
@@ -274,27 +395,29 @@ async function main() {
   let all;
   if (!existsSync(urlsFile) || opts.rescan) {
     if (!process.env.DATABASE_URL) {
-      console.log('Lần đầu cần đặt $env:DATABASE_URL (và bật TCP Proxy) để đọc danh sách link từ database.');
+      console.log('The first run needs $env:DATABASE_URL (and the MySQL TCP proxy) to read the image links.');
       process.exit(1);
     }
-    console.log('Đang đọc link ảnh từ database...');
+    console.log('Reading image links from the database...');
     all = await scanDatabase(process.env.DATABASE_URL);
     all.sort((a, b) => b.refs - a.refs);
     await fs.writeFile(urlsFile, JSON.stringify(all, null, 1));
-    const hosts = new Map();
-    for (const u of all) hosts.set(u.host.replace(/^(i\d+|img\d+|s\d+|www)\./, ''), (hosts.get(u.host.replace(/^(i\d+|img\d+|s\d+|www)\./, '')) || 0) + 1);
-    console.log(`Tổng ${all.length} link ảnh khác nhau. Nhiều nhất:`);
-    [...hosts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12).forEach(([h, n]) => console.log(`  ${h}: ${n}`));
+    console.log(`Found ${all.length} distinct image links.`);
   } else {
     all = JSON.parse(await fs.readFile(urlsFile, 'utf8'));
+    for (const item of all) item.provider = item.provider || providerOf(item.host);
   }
 
   const manifest = await readManifest(manifestFile);
-  let list = opts.host ? all.filter((u) => u.host.includes(opts.host)) : all;
+  await migrateLayout(out, manifest, manifestFile);
+
+  let list = all;
+  if (opts.provider) list = list.filter((u) => u.provider === opts.provider);
+  if (opts.host) list = list.filter((u) => u.host.includes(opts.host));
   if (opts.wayback) {
     list = list.filter((u) => {
       const rec = manifest.get(u.url);
-      return rec && rec.status !== 'ok' && rec.status !== 'suspect' && !rec.waybackTried;
+      return rec && rec.status && rec.status !== 'ok' && rec.status !== 'suspect' && !rec.waybackTried;
     });
   } else {
     list = list.filter((u) => {
@@ -306,11 +429,12 @@ async function main() {
     const step = list.length / opts.sample;
     list = Array.from({ length: opts.sample }, (_, i) => list[Math.floor(i * step)]);
   }
-  console.log(`Sẽ xử lý ${list.length} link${opts.wayback ? ' qua Wayback Machine' : ''}.`);
+  console.log(`Processing ${list.length} links${opts.wayback ? ' through the Wayback Machine' : ''}...`);
 
   const counts = {};
   let done = 0;
   let index = 0;
+  let lastSave = Date.now();
   const concurrency = opts.wayback ? Math.min(2, opts.concurrency) : opts.concurrency;
   const worker = async () => {
     while (index < list.length) {
@@ -348,6 +472,10 @@ async function main() {
         const summary = Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(', ');
         process.stdout.write(`\r${done}/${list.length}: ${summary}        `);
       }
+      if (Date.now() - lastSave > 60000) {
+        lastSave = Date.now();
+        await writeIndex(out, all, manifest);
+      }
       if (opts.wayback) await sleep(800);
     }
   };
@@ -356,27 +484,14 @@ async function main() {
 
   const suspects = await markSuspects(out, manifest, manifestFile);
   if (suspects.length) {
-    console.log('Ảnh nghi là ảnh báo lỗi của dịch vụ (cùng nội dung ở nhiều link), đã gom vào thư mục _nghi-van:');
-    suspects.forEach((s) => console.log(`  ${s.file}: ${s.urls} link, ${Math.round((s.bytes || 0) / 1024)} KB`));
+    console.log(`Possible "image not available" banners (same image behind many links), one copy each in ${SUSPECT_DIR}:`);
+    suspects.forEach((s) => console.log(`  ${s.file}: ${s.urls} links, ${Math.round((s.bytes || 0) / 1024)} KB`));
   }
-
-  // Tổng kết theo trạng thái và dung lượng.
-  const total = {};
-  let okBytes = 0;
-  let fromWayback = 0;
-  let waybackTried = 0;
-  for (const rec of manifest.values()) {
-    total[rec.status] = (total[rec.status] || 0) + 1;
-    if (rec.status === 'ok') okBytes += rec.bytes || 0;
-    if (rec.status === 'ok' && String(rec.source || '').startsWith('wayback')) fromWayback += 1;
-    if (rec.waybackTried) waybackTried += 1;
-  }
-  console.log('Tổng cộng đến giờ:', Object.entries(total).map(([k, v]) => `${k} ${v}`).join(', '));
-  if (waybackTried) console.log(`Wayback: đã thử ${waybackTried} link chết, cứu thêm được ${fromWayback}.`);
-  console.log(`Ảnh cứu được: ${total.ok || 0} file, ${(okBytes / 1048576).toFixed(1)} MB, lưu ở ${path.join(out, 'files')}`);
+  await writeIndex(out, all, manifest);
+  printSummary(all, manifest, out);
 }
 
 main().catch((err) => {
-  console.error('\nLỗi:', err.message);
+  console.error('\nError:', err.message);
   process.exit(1);
 });

@@ -1,13 +1,13 @@
-// Nhập ảnh từ bộ source vBulletin (đã giải nén) vào bảng panel_asset:
-//   avatar riêng (customavatars), ảnh hồ sơ (customprofilepics), ảnh chữ ký (signaturepics),
-//   smilie và avatar có sẵn: lấy đúng các file mà database đang trỏ tới (bảng smilie, avatar),
-//   cộng thêm mọi ảnh trong images/smilies và images/avatars.
+// Import images from the extracted vBulletin source folder into the panel_asset table:
+//   custom avatars (customavatars), profile pictures (customprofilepics), signature pictures (signaturepics),
+//   smilies and stock avatars: exactly the files the database points to (smilie, avatar tables),
+//   plus every image in images/smilies and images/avatars.
 //
-// Cách chạy (PowerShell, trong thư mục server, cần bật TCP Proxy của MySQL):
+// Usage (PowerShell, inside the server folder; needs the MySQL TCP proxy):
 //   $env:DATABASE_URL = "mysql://root:<password>@<host>:<port>/railway"
-//   node tools/import-assets.js "E:\FC Westlife\4rum VW"
+//   node tools/import-assets.js "E:\FC Westlife\4rum VW\forum\forum"
 //
-// Chạy lại nhiều lần không sao: file trùng đường dẫn sẽ được ghi đè.
+// Safe to run again: files with the same path are overwritten.
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import mysql from 'mysql2/promise';
@@ -43,7 +43,7 @@ async function childDir(parent, name) {
   }
 }
 
-// Thư mục gốc của forum: nơi có customavatars hoặc images/smilies.
+// Forum root = the folder that contains customavatars or images/smilies.
 async function findForumRoot(start, depth = 0) {
   if (depth > 6) return null;
   const avatars = await childDir(start, 'customavatars');
@@ -84,7 +84,7 @@ async function listImages(dir, recursive) {
 
 const relPath = (root, file) => path.relative(root, file).split(path.sep).join('/').toLowerCase();
 
-// Đường dẫn trong database (vd "images/onion/a.gif", "/forum/images/onion/a.gif") → file trên máy.
+// A path stored in the database ("images/onion/a.gif", "/forum/images/onion/a.gif") -> local file.
 async function resolveRef(root, ref) {
   let p = String(ref || '').trim();
   if (!p) return null;
@@ -122,7 +122,7 @@ async function collect(root, db) {
     }
   }
 
-  // Smilie và avatar có sẵn mà database đang dùng (gồm cả images/rabbit, images/onion...).
+  // Smilies and stock avatars the database uses (including images/rabbit, images/onion, ...).
   const missing = { smilie: 0, predefined: 0 };
   const [smilies] = await db.query('SELECT smiliepath AS p FROM smilie');
   const [avatars] = await db.query('SELECT avatarpath AS p FROM avatar').catch(() => [[]]);
@@ -148,25 +148,25 @@ async function main() {
   const source = process.argv[2];
   const uri = process.env.DATABASE_URL;
   if (!source || !uri) {
-    console.log('Cách dùng: đặt $env:DATABASE_URL rồi chạy  node tools/import-assets.js "<thư mục source forum>"');
+    console.log('Usage: set $env:DATABASE_URL, then run  node tools/import-assets.js "<forum source folder>"');
     process.exit(1);
   }
   const root = await findForumRoot(path.resolve(source));
   if (!root) {
-    console.log('Không tìm thấy thư mục customavatars hay images/smilies. Bạn đã giải nén source forum chưa?');
+    console.log('No customavatars or images/smilies folder found. Has the forum source been extracted?');
     process.exit(1);
   }
-  console.log(`Thư mục forum: ${root}`);
+  console.log(`Forum folder: ${root}`);
 
   const db = await mysql.createConnection({ uri, charset: 'utf8mb4' });
   const { items, missing } = await collect(root, db);
   const count = (k) => items.filter((i) => i.kind === k).length;
   console.log(
-    `Tìm thấy: ${count('avatar')} avatar, ${count('profilepic')} ảnh hồ sơ, ${count('sigpic')} ảnh chữ ký, `
-    + `${count('smilie')} smilie, ${count('predefined')} avatar có sẵn.`,
+    `Found: ${count('avatar')} avatars, ${count('profilepic')} profile pictures, ${count('sigpic')} signature pictures, `
+    + `${count('smilie')} smilies, ${count('predefined')} stock avatars.`,
   );
   if (missing.smilie || missing.predefined) {
-    console.log(`Database còn trỏ tới ${missing.smilie} smilie và ${missing.predefined} avatar có sẵn mà không thấy file (sẽ hiện dạng chữ).`);
+    console.log(`The database points to ${missing.smilie} smilies and ${missing.predefined} stock avatars without a file (they will show as text).`);
   }
   if (!items.length) {
     await db.end();
@@ -192,7 +192,7 @@ async function main() {
     if (!batch.length) return;
     await db.query('REPLACE INTO panel_asset (kind, path, userid, revision, mime, data) VALUES ?', [batch]);
     done += batch.length;
-    process.stdout.write(`\rĐã nhập ${done}/${items.length}`);
+    process.stdout.write(`\rImported ${done}/${items.length}`);
     batch = [];
     bytes = 0;
   };
@@ -205,10 +205,10 @@ async function main() {
   }
   await flush();
   await db.end();
-  console.log('\nXong. Panel sẽ tự thấy ảnh mới trong vòng 5 phút (hoặc bấm Restart service trên Railway).');
+  console.log('\nDone. The panel picks up new images within 5 minutes (or restart the service on Railway).');
 }
 
 main().catch((err) => {
-  console.error('\nLỗi:', err.message);
+  console.error('\nError:', err.message);
   process.exit(1);
 });
