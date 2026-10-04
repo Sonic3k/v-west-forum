@@ -19,9 +19,14 @@
 //          --wayback           retry dead links through the Internet Archive Wayback Machine
 //          --rescan            read the link list from the database again
 //          --refetch           download already saved images again and overwrite them (keeps the old file on failure)
-//          --profile <name>    request style: "navigate" (like typing the link in a browser) or "image" (like an
-//                              <img> tag). Default: navigate for Photobucket (avoids the watermark), image otherwise.
-//          --probe <url>       download one link in several ways into _probe/ to compare the results by eye
+//          --profile <name>    how to request an image (default: image):
+//                                image            like an <img> tag on another site
+//                                navigate         like typing the link into the browser address bar
+//                                page-referer     open the link like a browser (gets Photobucket's HTML viewer page,
+//                                                 with its cookies), then load the image as that page does
+//                                page-html        same, but use the image addresses found inside that HTML page
+//                                original-suffix  Photobucket's old "~original" address for the uploaded file
+//          --probe <url>       download one link in all these ways into _probe/ to compare the results by eye
 // Safe to re-run at any time: finished links are skipped, interrupted runs continue where they stopped.
 import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -59,9 +64,11 @@ const PROFILES = {
   },
 };
 
+const STRATEGIES = new Set(['image', 'navigate', 'page-referer', 'page-html', 'original-suffix']);
+
 function profileFor(provider, override) {
-  if (override && PROFILES[override]) return override;
-  return provider === 'photobucket' ? 'navigate' : 'image';
+  if (override && STRATEGIES.has(override)) return override;
+  return 'image';
 }
 const TIMEOUT_MS = 30000;
 const MAX_BYTES = 30 * 1024 * 1024;
@@ -173,7 +180,8 @@ function sniff(buf) {
 
 // Plain node:http(s) instead of fetch(): fetch() rewrites some headers (e.g. Sec-Fetch-Mode: cors),
 // which would make a "navigate" request look like an embedded one.
-function fetchBytes(url, headers = PROFILES.image, redirects = 0) {
+// jar: optional Map(name -> value); cookies set by every response are stored and sent on redirects.
+function fetchBytes(url, headers = PROFILES.image, redirects = 0, jar = null) {
   return new Promise((resolve, reject) => {
     let target;
     try {
@@ -183,11 +191,19 @@ function fetchBytes(url, headers = PROFILES.image, redirects = 0) {
       return;
     }
     const lib = target.protocol === 'https:' ? https : http;
-    const req = lib.request(target, { method: 'GET', headers, timeout: TIMEOUT_MS }, (res) => {
+    const sendHeaders = jar && jar.size ? { ...headers, Cookie: cookieHeader(jar) } : headers;
+    const req = lib.request(target, { method: 'GET', headers: sendHeaders, timeout: TIMEOUT_MS }, (res) => {
       const { statusCode } = res;
+      if (jar) {
+        for (const line of res.headers['set-cookie'] || []) {
+          const pair = line.split(';')[0];
+          const eq = pair.indexOf('=');
+          if (eq > 0) jar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+        }
+      }
       if ([301, 302, 303, 307, 308].includes(statusCode) && res.headers.location && redirects < 6) {
         res.resume();
-        resolve(fetchBytes(new URL(res.headers.location, target).href, headers, redirects + 1));
+        resolve(fetchBytes(new URL(res.headers.location, target).href, headers, redirects + 1, jar));
         return;
       }
       const chunks = [];
@@ -207,7 +223,7 @@ function fetchBytes(url, headers = PROFILES.image, redirects = 0) {
         } catch {
           // keep raw bytes
         }
-        resolve({ status: statusCode, finalUrl: target.href, buf });
+        resolve({ status: statusCode, finalUrl: target.href, buf, contentType: String(res.headers['content-type'] || '') });
       });
       res.on('error', reject);
     });
@@ -219,6 +235,108 @@ function fetchBytes(url, headers = PROFILES.image, redirects = 0) {
     req.on('error', reject);
     req.end();
   });
+}
+
+function cookieHeader(jar) {
+  return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+const toHttps = (url) => url.replace(/^http:\/\//i, 'https://');
+
+function siteRelation(from, to) {
+  const a = new URL(from);
+  const b = new URL(to);
+  if (a.origin === b.origin) return 'same-origin';
+  const root = (h) => h.split('.').slice(-2).join('.');
+  return root(a.hostname) === root(b.hostname) ? 'same-site' : 'cross-site';
+}
+
+// Headers of an image that an HTML page loads itself (same-site, with the page as Referer and its cookies).
+function inPageImageHeaders(pageUrl, imageUrl, jar) {
+  const headers = {
+    'User-Agent': UA,
+    Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+    Referer: pageUrl,
+    'Sec-Fetch-Dest': 'image',
+    'Sec-Fetch-Mode': 'no-cors',
+    'Sec-Fetch-Site': siteRelation(pageUrl, imageUrl),
+    'sec-ch-ua': PROFILES.navigate['sec-ch-ua'],
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+  };
+  if (jar && jar.size) headers.Cookie = cookieHeader(jar);
+  return headers;
+}
+
+// Image addresses inside an HTML page: og:image / twitter:image, <img src>, and any image URL in scripts.
+// Addresses containing the original file name come first.
+function extractImageUrls(html, pageUrl, originalUrl) {
+  const text = html.replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/&amp;/g, '&');
+  let base = path.posix.basename(new URL(originalUrl).pathname);
+  try {
+    base = decodeURIComponent(base);
+  } catch {
+    // keep as is
+  }
+  base = base.toLowerCase().replace(/\.[a-z0-9]+$/, '');
+  const found = new Map();
+  const add = (raw, weight) => {
+    let abs;
+    try {
+      abs = new URL(raw, pageUrl).href;
+    } catch {
+      return;
+    }
+    let lower = abs.toLowerCase();
+    try {
+      lower = decodeURIComponent(lower);
+    } catch {
+      // keep as is
+    }
+    const score = weight + (base && lower.includes(base) ? 5 : 0);
+    if (!found.has(abs) || found.get(abs) < score) found.set(abs, score);
+  };
+  for (const m of text.matchAll(/<meta[^>]+(?:property|name)=["'](?:og:image(?::secure_url)?|twitter:image(?::src)?)["'][^>]*content=["']([^"']+)["']/gi)) add(m[1], 3);
+  for (const m of text.matchAll(/<meta[^>]+content=["']([^"']+)["'][^>]*(?:property|name)=["'](?:og:image|twitter:image)["']/gi)) add(m[1], 3);
+  for (const m of text.matchAll(/<img[^>]+src=["']([^"']+)["']/gi)) add(m[1], 1);
+  for (const m of text.matchAll(/https?:\/\/[^"'\s<>()\\]+?\.(?:jpe?g|png|gif|webp|bmp)(?:\?[^"'\s<>()\\]*)?/gi)) add(m[0], 1);
+  return [...found.entries()]
+    .filter(([, score]) => score >= 3)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([u]) => u);
+}
+
+// Open the link like a browser. Returns the image directly if the server sends one,
+// otherwise the HTML page (as text) with its final address and cookies.
+async function openAsBrowser(url) {
+  const jar = new Map();
+  const r = await fetchBytes(toHttps(url), PROFILES.navigate, 0, jar);
+  return { ...r, jar, ext: r.status === 200 ? sniff(r.buf) : null };
+}
+
+async function pageStrategy(url, mode) {
+  let page;
+  try {
+    page = await openAsBrowser(url);
+  } catch (err) {
+    return { status: 'error', detail: err.code || err.message };
+  }
+  if (page.status === 404 || page.status === 410) return { status: 'not_found', finalUrl: page.finalUrl };
+  if (page.ext) return { status: 'ok', ext: page.ext, buf: page.buf, finalUrl: page.finalUrl };
+  if (page.status !== 200) return { status: `http_${page.status}`, finalUrl: page.finalUrl };
+  const html = page.buf.toString('utf8');
+  const original = toHttps(url);
+  const candidates = mode === 'page-referer'
+    ? [original]
+    : extractImageUrls(html, page.finalUrl, original).filter((u) => u !== original);
+  for (const candidate of candidates) {
+    const r = await attempt(candidate, inPageImageHeaders(page.finalUrl, candidate, page.jar));
+    if (r.status === 'ok') return { ...r, via: candidate };
+  }
+  return { status: candidates.length ? 'not_image' : 'no_image_in_page', finalUrl: page.finalUrl };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -250,6 +368,11 @@ async function attempt(target, headers) {
 // Original link first; the https variant only when the http link got no answer at all.
 // Photobucket: https first (that is what a browser opens today).
 async function tryDownload(url, profile = 'image') {
+  if (profile === 'page-referer' || profile === 'page-html') return pageStrategy(url, profile);
+  if (profile === 'original-suffix') {
+    const r = await attempt(`${toHttps(url)}~original`, PROFILES.image);
+    return r.status === 'ok' ? { ...r, via: `${toHttps(url)}~original` } : r;
+  }
   const headers = PROFILES[profile] || PROFILES.image;
   const https = url.startsWith('http://') ? `https://${url.slice(7)}` : null;
   let candidates = https ? [url, https] : [url];
@@ -404,36 +527,59 @@ async function markSuspects(out, manifest, manifestFile) {
 }
 
 // ---------- probe ----------
-// Download one link in several ways so the results can be compared by eye.
+// Download one link in every supported way so the results can be compared by eye.
 async function probe(out, url) {
   const dir = path.join(out, '_probe');
+  await fs.rm(dir, { recursive: true, force: true });
   await fs.mkdir(dir, { recursive: true });
-  const https = url.replace(/^http:\/\//i, 'https://');
-  const http = url.replace(/^https:\/\//i, 'http://');
-  const u = new URL(https);
-  const variants = [
-    ['1-https-navigate', https, 'navigate'],
-    ['2-http-navigate', http, 'navigate'],
-    ['3-https-image', https, 'image'],
-    ['4-http-image', http, 'image'],
-  ];
-  if (/photobucket\.com$/i.test(u.hostname)) {
-    variants.push(['5-hosting-navigate', `https://hosting.photobucket.com${u.pathname}`, 'navigate']);
-  }
-  console.log(`Probing ${url}`);
-  for (const [name, target, profile] of variants) {
-    const r = await attempt(target, PROFILES[profile]);
-    let line = `  ${name.padEnd(20)} ${r.status.padEnd(10)}`;
+  const httpsUrl = toHttps(url);
+  const httpUrl = url.replace(/^https:\/\//i, 'http://');
+  const lines = [];
+  const save = async (name, r, target) => {
+    let line = `  ${name.padEnd(24)} ${String(r.status).padEnd(16)}`;
     if (r.status === 'ok') {
-      const file = path.join(dir, `${name}.${r.ext}`);
-      await fs.writeFile(file, r.buf);
+      await fs.writeFile(path.join(dir, `${name}.${r.ext}`), r.buf);
       const hash = crypto.createHash('sha256').update(r.buf).digest('hex').slice(0, 12);
       line += ` ${String(r.buf.length).padStart(8)} bytes  sha ${hash}`;
     }
     if (r.finalUrl && r.finalUrl !== target) line += `  -> ${r.finalUrl}`;
     console.log(line);
+    lines.push(line);
+  };
+
+  console.log(`Probing ${url}`);
+  for (const [name, target, profile] of [
+    ['1-https-navigate', httpsUrl, 'navigate'],
+    ['2-http-navigate', httpUrl, 'navigate'],
+    ['3-https-image', httpsUrl, 'image'],
+    ['4-http-image', httpUrl, 'image'],
+  ]) {
+    await save(name, await attempt(target, PROFILES[profile]), target);
   }
-  console.log(`Saved to ${dir}. Open the files and check which ones have no watermark.`);
+  await save('5-original-suffix', await attempt(`${httpsUrl}~original`, PROFILES.image), `${httpsUrl}~original`);
+
+  // Open like a browser, keep the HTML viewer page, then load images the way that page would.
+  let page = null;
+  try {
+    page = await openAsBrowser(url);
+  } catch (err) {
+    console.log(`  (could not open the page: ${err.code || err.message})`);
+  }
+  if (page && !page.ext && page.status === 200) {
+    await fs.writeFile(path.join(dir, 'page.html'), page.buf);
+    console.log(`  page.html saved (${page.buf.length} bytes, cookies: ${[...page.jar.keys()].join(', ') || 'none'})`);
+    const candidates = extractImageUrls(page.buf.toString('utf8'), page.finalUrl, httpsUrl);
+    const withOriginal = [httpsUrl, ...candidates.filter((c) => c !== httpsUrl)];
+    for (let i = 0; i < withOriginal.length; i += 1) {
+      const candidate = withOriginal[i];
+      const name = i === 0 ? '6-page-referer' : `7-page-html-${i}`;
+      const r = await attempt(candidate, inPageImageHeaders(page.finalUrl, candidate, page.jar));
+      await save(name, r, candidate);
+      if (i > 0) console.log(`      ${candidate}`);
+    }
+  }
+  await fs.writeFile(path.join(dir, 'probe.txt'), `${url}\n${lines.join('\n')}\n`);
+  console.log(`Saved to ${dir}. Open the image files and check which ones have no watermark.`);
 }
 
 // ---------- reports ----------
