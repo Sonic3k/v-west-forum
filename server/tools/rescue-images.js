@@ -1,33 +1,27 @@
-// Rescue externally hosted images (Photobucket, Blogspot, Flickr, ...) embedded with [IMG] in the forum.
-// Reads the database only; images are saved to a local folder, grouped by provider:
-//   <out>/images/<provider>/<host>/<original path>      e.g. images/photobucket/i123.photobucket.com/albums/...
-//   <out>/_suspected-placeholders/                        one copy of each image that looks like a "not available" banner
-//   <out>/urls.json        all image links found in the database (so later runs do not need the database)
-//   <out>/manifest.jsonl   one line per processed link; used to resume and to publish later
-//   <out>/index.csv        spreadsheet-friendly list: url, provider, host, status, origin, file, bytes, refs
+// Rescue externally hosted images (Photobucket, Blogspot, Flickr, ...) embedded with [IMG] in the forum,
+// keeping the most original copy that can still be found. Reads the database only; files go to a local folder.
 //
-// Usage (PowerShell, inside the server folder; the first run needs the MySQL TCP proxy):
+// Layout of the output folder:
+//   images/<provider>/<host>/<original path>   one file per link, the best copy found
+//   _suspected-placeholders/                   one copy of each image that looks like a "not available" banner
+//   index.csv                                  url -> file, provider, quality, origin (open it with Excel)
+//   urls.json, manifest.jsonl                  tool state (link list and per-link results; used to resume)
+//
+// Quality of a saved copy:
+//   original  the file as the host serves it, or a Wayback Machine capture (Photobucket: captured before July 2017)
+//   viewer    Photobucket today: no watermark, but possibly reduced and marked "Low Res"
+//
+// Usage (PowerShell, inside the server folder; the first run reads the database through the MySQL TCP proxy):
 //   $env:DATABASE_URL = "mysql://root:<password>@<host>:<port>/railway"
-//   node tools/rescue-images.js --out "E:\FC Westlife\external-images" --provider photobucket --sample 50
-//   node tools/rescue-images.js --out "E:\FC Westlife\external-images"
-//   node tools/rescue-images.js --out "E:\FC Westlife\external-images" --wayback
-//
-// Options: --provider <name>   only links from this provider (photobucket, facebook, google, ...)
-//          --host <text>       only links whose host contains this text
+//   node tools/rescue-images.js --out "E:\FC Westlife\external-images"             step 1: download everything
+//   node tools/rescue-images.js --out "E:\FC Westlife\external-images" --wayback   step 2: dead links + Photobucket
+//                                                                                   upgrades from the Wayback Machine
+// Options: --provider <name>   only one provider (photobucket, google, flickr, facebook, ...)
 //          --sample <n>        only try n links, spread evenly over the list
-//          --concurrency <n>   parallel downloads (default 4)
-//          --wayback           retry dead links through the Internet Archive Wayback Machine
+//          --concurrency <n>   parallel downloads (default 4; Wayback always uses 2)
 //          --rescan            read the link list from the database again
-//          --refetch           download already saved images again and overwrite them (keeps the old file on failure)
-//          --profile <name>    how to request an image (default: image):
-//                                image            like an <img> tag on another site
-//                                navigate         like typing the link into the browser address bar
-//                                page-referer     open the link like a browser (gets Photobucket's HTML viewer page,
-//                                                 with its cookies), then load the image as that page does
-//                                page-html        same, but use the image addresses found inside that HTML page
-//                                original-suffix  Photobucket's old "~original" address for the uploaded file
-//          --probe <url>       download one link in all these ways into _probe/ to compare the results by eye
-// Safe to re-run at any time: finished links are skipped, interrupted runs continue where they stopped.
+//          --probe <url>       download one link in every supported way into _probe/ to compare by eye
+// Safe to stop and re-run at any time: finished links are skipped.
 import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -39,15 +33,25 @@ import mysql from 'mysql2/promise';
 import { providerOf } from '../src/providers.js';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const TIMEOUT_MS = 30000;
+const MAX_BYTES = 30 * 1024 * 1024;
+const SUSPECT_MIN_URLS = 8; // identical bytes behind >= 8 different links => most likely a placeholder banner
+const PHOTOBUCKET_CUTOFF = '20170701'; // Photobucket started blocking/watermarking embeds in July 2017
+// Wayback Machine endpoints (overridable for testing).
+const WAYBACK_API = process.env.WAYBACK_API_BASE || 'https://archive.org';
+const WAYBACK_WEB = process.env.WAYBACK_WEB_BASE || 'https://web.archive.org';
+const IMAGES_DIR = 'images';
+const SUSPECT_DIR = '_suspected-placeholders';
 
-// How a request looks to the server. Photobucket serves the original only to a "navigate" request
-// (a link typed into the browser); embedded-image style requests get a watermarked copy.
-// Some hosts (e.g. imgur) answer a navigate request with an HTML page, so "image" stays the default elsewhere.
+// ---------- request styles ----------
+const CH_UA = '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"';
 const PROFILES = {
+  // like an <img> tag on another site
   image: {
     'User-Agent': UA,
     Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
   },
+  // like typing the link into the browser address bar
   navigate: {
     'User-Agent': UA,
     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -58,42 +62,27 @@ const PROFILES = {
     'Sec-Fetch-Site': 'none',
     'Sec-Fetch-User': '?1',
     'Upgrade-Insecure-Requests': '1',
-    'sec-ch-ua': '"Chromium";v="126", "Google Chrome";v="126", "Not-A.Brand";v="99"',
+    'sec-ch-ua': CH_UA,
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"Windows"',
   },
 };
 
-const STRATEGIES = new Set(['image', 'navigate', 'page-referer', 'page-html', 'original-suffix']);
-
-function profileFor(provider, override) {
-  if (override && STRATEGIES.has(override)) return override;
-  return 'image';
-}
-const TIMEOUT_MS = 30000;
-const MAX_BYTES = 30 * 1024 * 1024;
-const SUSPECT_MIN_URLS = 8; // identical bytes behind >= 8 different links => most likely a placeholder banner
-const FINAL = new Set(['ok', 'not_found', 'suspect']);
-const IMAGES_DIR = 'images';
-const SUSPECT_DIR = '_suspected-placeholders';
+// Photobucket: an embedded-style request gets a watermarked copy, a typed link gets an HTML viewer page.
+// "page-referer" opens that page like a browser (keeping its cookies), then loads the image as the page does.
+const defaultStrategy = (provider) => (provider === 'photobucket' ? 'page-referer' : 'image');
 
 // ---------- arguments ----------
 function parseArgs(argv) {
-  const opts = {
-    out: null, host: null, provider: null, sample: 0, concurrency: 4,
-    wayback: false, rescan: false, refetch: false, profile: null, probe: null,
-  };
+  const opts = { out: null, provider: null, sample: 0, concurrency: 4, wayback: false, rescan: false, probe: null };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--out') opts.out = argv[++i];
-    else if (a === '--host') opts.host = String(argv[++i] || '').toLowerCase();
     else if (a === '--provider') opts.provider = String(argv[++i] || '').toLowerCase();
     else if (a === '--sample') opts.sample = Number(argv[++i]) || 0;
     else if (a === '--concurrency') opts.concurrency = Math.max(1, Math.min(16, Number(argv[++i]) || 4));
     else if (a === '--wayback') opts.wayback = true;
     else if (a === '--rescan') opts.rescan = true;
-    else if (a === '--refetch') opts.refetch = true;
-    else if (a === '--profile') opts.profile = String(argv[++i] || '').toLowerCase();
     else if (a === '--probe') opts.probe = argv[++i];
   }
   return opts;
@@ -167,7 +156,7 @@ async function scanDatabase(uri) {
   return [...urls.values()];
 }
 
-// ---------- download ----------
+// ---------- HTTP ----------
 function sniff(buf) {
   if (!buf || buf.length < 12) return null;
   if (buf.toString('latin1', 0, 3) === 'GIF') return 'gif';
@@ -178,9 +167,10 @@ function sniff(buf) {
   return null;
 }
 
-// Plain node:http(s) instead of fetch(): fetch() rewrites some headers (e.g. Sec-Fetch-Mode: cors),
-// which would make a "navigate" request look like an embedded one.
-// jar: optional Map(name -> value); cookies set by every response are stored and sent on redirects.
+const cookieHeader = (jar) => [...jar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+
+// Plain node:http(s) instead of fetch(): fetch() rewrites some headers (e.g. Sec-Fetch-Mode: cors).
+// jar: optional Map(name -> value); cookies set by every response are kept and sent on redirects.
 function fetchBytes(url, headers = PROFILES.image, redirects = 0, jar = null) {
   return new Promise((resolve, reject) => {
     let target;
@@ -223,7 +213,7 @@ function fetchBytes(url, headers = PROFILES.image, redirects = 0, jar = null) {
         } catch {
           // keep raw bytes
         }
-        resolve({ status: statusCode, finalUrl: target.href, buf, contentType: String(res.headers['content-type'] || '') });
+        resolve({ status: statusCode, finalUrl: target.href, buf });
       });
       res.on('error', reject);
     });
@@ -237,11 +227,32 @@ function fetchBytes(url, headers = PROFILES.image, redirects = 0, jar = null) {
   });
 }
 
-function cookieHeader(jar) {
-  return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
-}
-
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const toHttps = (url) => url.replace(/^http:\/\//i, 'https://');
+
+// One address, retried on network errors and rate limiting.
+async function attempt(target, headers) {
+  let last = { status: 'error', detail: 'download failed' };
+  for (let i = 0; i < 2; i += 1) {
+    try {
+      const r = await fetchBytes(target, headers);
+      if (r.status === 429 || r.status === 503) {
+        last = { status: `http_${r.status}`, detail: 'rate limited' };
+        await sleep(20000);
+        continue;
+      }
+      if (r.status === 404 || r.status === 410) return { status: 'not_found', finalUrl: r.finalUrl };
+      if (r.status !== 200) return { status: `http_${r.status}`, finalUrl: r.finalUrl };
+      const ext = sniff(r.buf);
+      if (!ext) return { status: 'not_image', finalUrl: r.finalUrl, bytes: r.buf.length };
+      return { status: 'ok', ext, buf: r.buf, finalUrl: r.finalUrl };
+    } catch (err) {
+      last = { status: 'error', detail: err.name === 'AbortError' ? 'timeout' : (err.code || err.cause?.code || err.message) };
+      await sleep(1500);
+    }
+  }
+  return last;
+}
 
 function siteRelation(from, to) {
   const a = new URL(from);
@@ -251,7 +262,7 @@ function siteRelation(from, to) {
   return root(a.hostname) === root(b.hostname) ? 'same-site' : 'cross-site';
 }
 
-// Headers of an image that an HTML page loads itself (same-site, with the page as Referer and its cookies).
+// Headers of an image that an HTML page loads itself (the page as Referer, with its cookies).
 function inPageImageHeaders(pageUrl, imageUrl, jar) {
   const headers = {
     'User-Agent': UA,
@@ -262,7 +273,7 @@ function inPageImageHeaders(pageUrl, imageUrl, jar) {
     'Sec-Fetch-Dest': 'image',
     'Sec-Fetch-Mode': 'no-cors',
     'Sec-Fetch-Site': siteRelation(pageUrl, imageUrl),
-    'sec-ch-ua': PROFILES.navigate['sec-ch-ua'],
+    'sec-ch-ua': CH_UA,
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"Windows"',
   };
@@ -270,8 +281,7 @@ function inPageImageHeaders(pageUrl, imageUrl, jar) {
   return headers;
 }
 
-// Image addresses inside an HTML page: og:image / twitter:image, <img src>, and any image URL in scripts.
-// Addresses containing the original file name come first.
+// Image addresses inside an HTML page (og:image, <img src>, URLs in scripts); the original file name first.
 function extractImageUrls(html, pageUrl, originalUrl) {
   const text = html.replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/&amp;/g, '&');
   let base = path.posix.basename(new URL(originalUrl).pathname);
@@ -302,22 +312,17 @@ function extractImageUrls(html, pageUrl, originalUrl) {
   for (const m of text.matchAll(/<meta[^>]+content=["']([^"']+)["'][^>]*(?:property|name)=["'](?:og:image|twitter:image)["']/gi)) add(m[1], 3);
   for (const m of text.matchAll(/<img[^>]+src=["']([^"']+)["']/gi)) add(m[1], 1);
   for (const m of text.matchAll(/https?:\/\/[^"'\s<>()\\]+?\.(?:jpe?g|png|gif|webp|bmp)(?:\?[^"'\s<>()\\]*)?/gi)) add(m[0], 1);
-  return [...found.entries()]
-    .filter(([, score]) => score >= 3)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 6)
-    .map(([u]) => u);
+  return [...found.entries()].filter(([, score]) => score >= 3).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([u]) => u);
 }
 
-// Open the link like a browser. Returns the image directly if the server sends one,
-// otherwise the HTML page (as text) with its final address and cookies.
 async function openAsBrowser(url) {
   const jar = new Map();
   const r = await fetchBytes(toHttps(url), PROFILES.navigate, 0, jar);
   return { ...r, jar, ext: r.status === 200 ? sniff(r.buf) : null };
 }
 
-async function pageStrategy(url, mode) {
+// Open the link like a browser, then load the image the way the viewer page does.
+async function pageReferer(url) {
   let page;
   try {
     page = await openAsBrowser(url);
@@ -327,59 +332,17 @@ async function pageStrategy(url, mode) {
   if (page.status === 404 || page.status === 410) return { status: 'not_found', finalUrl: page.finalUrl };
   if (page.ext) return { status: 'ok', ext: page.ext, buf: page.buf, finalUrl: page.finalUrl };
   if (page.status !== 200) return { status: `http_${page.status}`, finalUrl: page.finalUrl };
-  const html = page.buf.toString('utf8');
   const original = toHttps(url);
-  const candidates = mode === 'page-referer'
-    ? [original]
-    : extractImageUrls(html, page.finalUrl, original).filter((u) => u !== original);
-  for (const candidate of candidates) {
-    const r = await attempt(candidate, inPageImageHeaders(page.finalUrl, candidate, page.jar));
-    if (r.status === 'ok') return { ...r, via: candidate };
-  }
-  return { status: candidates.length ? 'not_image' : 'no_image_in_page', finalUrl: page.finalUrl };
+  return attempt(original, inPageImageHeaders(page.finalUrl, original, page.jar));
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// One address, retried on network errors and rate limiting.
-async function attempt(target, headers) {
-  let last = { status: 'error', detail: 'download failed' };
-  for (let i = 0; i < 2; i += 1) {
-    try {
-      const r = await fetchBytes(target, headers);
-      if (r.status === 429 || r.status === 503) {
-        last = { status: `http_${r.status}`, detail: 'rate limited' };
-        await sleep(20000);
-        continue;
-      }
-      if (r.status === 404 || r.status === 410) return { status: 'not_found', finalUrl: r.finalUrl };
-      if (r.status !== 200) return { status: `http_${r.status}`, finalUrl: r.finalUrl };
-      const ext = sniff(r.buf);
-      if (!ext) return { status: 'not_image', finalUrl: r.finalUrl, bytes: r.buf.length };
-      return { status: 'ok', ext, buf: r.buf, finalUrl: r.finalUrl };
-    } catch (err) {
-      last = { status: 'error', detail: err.name === 'AbortError' ? 'timeout' : (err.code || err.cause?.code || err.message) };
-      await sleep(1500);
-    }
-  }
-  return last;
-}
-
-// Original link first; the https variant only when the http link got no answer at all.
-// Photobucket: https first (that is what a browser opens today).
-async function tryDownload(url, profile = 'image') {
-  if (profile === 'page-referer' || profile === 'page-html') return pageStrategy(url, profile);
-  if (profile === 'original-suffix') {
-    const r = await attempt(`${toHttps(url)}~original`, PROFILES.image);
-    return r.status === 'ok' ? { ...r, via: `${toHttps(url)}~original` } : r;
-  }
-  const headers = PROFILES[profile] || PROFILES.image;
-  const https = url.startsWith('http://') ? `https://${url.slice(7)}` : null;
-  let candidates = https ? [url, https] : [url];
-  if (https && providerOf(new URL(url).hostname) === 'photobucket') candidates = [https, url];
+// One link with one strategy. Plain links: the original address first, https only if http got no answer.
+async function download(url, strategy) {
+  if (strategy === 'page-referer') return pageReferer(url);
+  const https = url.startsWith('http://') ? toHttps(url) : null;
   let best = null;
-  for (const candidate of candidates) {
-    const r = await attempt(candidate, headers);
+  for (const candidate of https ? [url, https] : [url]) {
+    const r = await attempt(candidate, PROFILES.image);
     if (r.status === 'ok') return r;
     if (!best || (best.status === 'error' && r.status !== 'error')) best = r;
     if (r.status !== 'error') break;
@@ -387,15 +350,51 @@ async function tryDownload(url, profile = 'image') {
   return best;
 }
 
-async function waybackDownload(url) {
-  const api = `https://archive.org/wayback/available?url=${encodeURIComponent(url)}&timestamp=20120101`;
+// Larger versions to try before the link itself (thumbnails and resized copies point to the original).
+function originalCandidates(url, provider) {
+  const out = [];
+  try {
+    const u = new URL(url);
+    if (provider === 'google') {
+      // Blogger / Google Photos: /s400/ or =s400 means "resized to 400px"; s0 means original size.
+      const sized = u.pathname.replace(/\/(?:s|w|h)\d+(?:-[a-z0-9-]+)?\//i, '/s0/');
+      if (sized !== u.pathname) out.push(`${u.origin}${sized}${u.search}`);
+      if (/=[swh]\d+[^/?#]*$/i.test(u.pathname)) out.push(`${u.origin}${u.pathname.replace(/=[swh]\d+[^/?#]*$/i, '=s0')}${u.search}`);
+    }
+    if (provider === 'photobucket') {
+      const base = path.posix.basename(u.pathname);
+      if (/^th_/i.test(base)) out.push(`${u.origin}${u.pathname.slice(0, -base.length)}${base.slice(3)}${u.search}`);
+    }
+  } catch {
+    // keep only the link itself
+  }
+  return [...new Set([...out, url])];
+}
+
+async function bestDownload(item) {
+  const strategy = defaultStrategy(item.provider);
+  let last = null;
+  for (const candidate of originalCandidates(item.url, item.provider)) {
+    const r = await download(candidate, strategy);
+    if (r.status === 'ok') return { ...r, strategy, via: candidate !== item.url ? candidate : undefined };
+    last = r;
+  }
+  return { ...last, strategy };
+}
+
+// ---------- Wayback Machine ----------
+async function waybackDownload(url, provider) {
+  const when = provider === 'photobucket' ? '20150101' : '20120101';
+  const api = `${WAYBACK_API}/wayback/available?url=${encodeURIComponent(url)}&timestamp=${when}`;
   try {
     const r = await fetchBytes(api, { 'User-Agent': UA, Accept: 'application/json' });
     if (r.status !== 200) return { status: `wayback_http_${r.status}` };
     const snap = JSON.parse(r.buf.toString('utf8'))?.archived_snapshots?.closest;
     if (!snap?.available || String(snap.status) !== '200') return { status: 'wayback_none' };
-    const result = await tryDownload(`https://web.archive.org/web/${snap.timestamp}id_/${url}`);
-    return result.status === 'ok' ? { ...result, snapshot: snap.timestamp } : { status: `wayback_${result.status}` };
+    // After July 2017 Photobucket captures are usually watermarks or "please update your account" banners.
+    if (provider === 'photobucket' && String(snap.timestamp) >= PHOTOBUCKET_CUTOFF) return { status: 'wayback_too_late' };
+    const result = await attempt(`${WAYBACK_WEB}/web/${snap.timestamp}id_/${url}`, PROFILES.image);
+    return result.status === 'ok' ? { ...result, snapshot: String(snap.timestamp) } : { status: `wayback_${result.status}` };
   } catch (err) {
     return { status: 'wayback_error', detail: err.message };
   }
@@ -422,9 +421,9 @@ function localPath(out, url, ext) {
   let name = parts.pop();
   const hash = crypto.createHash('sha1').update(url).digest('hex').slice(0, 8);
   if (u.search) name = `${name}__${hash}`;
-  // The extension must match the real format (Photobucket may send WebP for a .jpg link).
+  // The extension follows the real format (Photobucket may send WebP for a .jpg link).
   const current = /\.(jpe?g|jpe|png|gif|webp|bmp)$/i.exec(name);
-  const same = current && (current[1].toLowerCase() === ext || (ext === 'jpg' && /^jpe?g|jpe$/i.test(current[1])));
+  const same = current && (current[1].toLowerCase() === ext || (ext === 'jpg' && /^(jpe?g|jpe)$/i.test(current[1])));
   if (current && !same) name = `${name.slice(0, -current[0].length)}.${ext}`;
   else if (!current) name = `${name}.${ext}`;
   let full = path.join(out, IMAGES_DIR, provider, host, ...parts, name);
@@ -432,22 +431,18 @@ function localPath(out, url, ext) {
   return full;
 }
 
-async function removeEmptyDirs(dir) {
-  if (!existsSync(dir)) return;
-  for (const e of await fs.readdir(dir, { withFileTypes: true })) {
-    if (e.isDirectory()) await removeEmptyDirs(path.join(dir, e.name));
-  }
-  if ((await fs.readdir(dir)).length === 0) await fs.rmdir(dir);
-}
-
-async function moveFile(from, to) {
-  await fs.mkdir(path.dirname(to), { recursive: true });
-  try {
-    await fs.rename(from, to);
-  } catch {
-    await fs.copyFile(from, to);
-    await fs.rm(from, { force: true });
-  }
+async function saveImage(out, url, result, previousFile) {
+  const file = localPath(out, url, result.ext);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, result.buf);
+  const relative = path.relative(out, file);
+  if (previousFile && previousFile !== relative) await fs.rm(path.join(out, previousFile), { force: true });
+  return {
+    file: relative,
+    ext: result.ext,
+    bytes: result.buf.length,
+    sha256: crypto.createHash('sha256').update(result.buf).digest('hex'),
+  };
 }
 
 // ---------- manifest ----------
@@ -465,36 +460,6 @@ async function readManifest(file) {
     }
   }
   return map;
-}
-
-// Files saved by the first version of this tool (files/<host>/..., _nghi-van/) are moved to the new layout.
-async function migrateLayout(out, manifest, manifestFile) {
-  const lines = [];
-  const moved = new Map();
-  for (const rec of manifest.values()) {
-    if (!rec.file) continue;
-    const oldRel = rec.file;
-    let newRel = null;
-    if (rec.status === 'ok' && /^files[\\/]/.test(oldRel) && rec.ext) {
-      newRel = path.relative(out, localPath(out, rec.url, rec.ext));
-    } else if (rec.status === 'suspect' && /^_nghi-van[\\/]/.test(oldRel)) {
-      newRel = path.join(SUSPECT_DIR, path.basename(oldRel));
-    }
-    if (!newRel || newRel === oldRel) continue;
-    const from = path.join(out, oldRel);
-    if (!moved.has(oldRel) && existsSync(from)) {
-      await moveFile(from, path.join(out, newRel));
-      moved.set(oldRel, newRel);
-    }
-    rec.file = newRel;
-    lines.push(JSON.stringify({ url: rec.url, file: newRel, at: new Date().toISOString() }));
-  }
-  if (lines.length) {
-    await fs.appendFile(manifestFile, `${lines.join('\n')}\n`);
-    await removeEmptyDirs(path.join(out, 'files'));
-    await removeEmptyDirs(path.join(out, '_nghi-van'));
-    console.log(`Moved ${moved.size} files from the old folder layout to ${IMAGES_DIR}/<provider>/...`);
-  }
 }
 
 // Same bytes behind many different links => most likely the provider's "image not available" banner.
@@ -540,7 +505,7 @@ async function probe(out, url) {
   const httpUrl = url.replace(/^https:\/\//i, 'http://');
   const lines = [];
   const save = async (name, r, target) => {
-    let line = `  ${name.padEnd(24)} ${String(r.status).padEnd(16)}`;
+    let line = `  ${name.padEnd(24)} ${String(r.status).padEnd(18)}`;
     if (r.status === 'ok') {
       await fs.writeFile(path.join(dir, `${name}.${r.ext}`), r.buf);
       const hash = crypto.createHash('sha256').update(r.buf).digest('hex').slice(0, 12);
@@ -550,65 +515,57 @@ async function probe(out, url) {
     console.log(line);
     lines.push(line);
   };
-
   console.log(`Probing ${url}`);
-  for (const [name, target, profile] of [
-    ['1-https-navigate', httpsUrl, 'navigate'],
-    ['2-http-navigate', httpUrl, 'navigate'],
-    ['3-https-image', httpsUrl, 'image'],
-    ['4-http-image', httpUrl, 'image'],
-  ]) {
-    await save(name, await attempt(target, PROFILES[profile]), target);
-  }
-  await save('5-original-suffix', await attempt(`${httpsUrl}~original`, PROFILES.image), `${httpsUrl}~original`);
-
-  // Open like a browser, keep the HTML viewer page, then load images the way that page would.
+  await save('1-https-navigate', await attempt(httpsUrl, PROFILES.navigate), httpsUrl);
+  await save('2-https-image', await attempt(httpsUrl, PROFILES.image), httpsUrl);
+  await save('3-http-image', await attempt(httpUrl, PROFILES.image), httpUrl);
+  await save('4-page-referer', await pageReferer(url), httpsUrl);
   let page = null;
   try {
     page = await openAsBrowser(url);
-  } catch (err) {
-    console.log(`  (could not open the page: ${err.code || err.message})`);
+  } catch {
+    // no page
   }
   if (page && !page.ext && page.status === 200) {
     await fs.writeFile(path.join(dir, 'page.html'), page.buf);
-    console.log(`  page.html saved (${page.buf.length} bytes, cookies: ${[...page.jar.keys()].join(', ') || 'none'})`);
-    const candidates = extractImageUrls(page.buf.toString('utf8'), page.finalUrl, httpsUrl);
-    const withOriginal = [httpsUrl, ...candidates.filter((c) => c !== httpsUrl)];
-    for (let i = 0; i < withOriginal.length; i += 1) {
-      const candidate = withOriginal[i];
-      const name = i === 0 ? '6-page-referer' : `7-page-html-${i}`;
-      const r = await attempt(candidate, inPageImageHeaders(page.finalUrl, candidate, page.jar));
-      await save(name, r, candidate);
-      if (i > 0) console.log(`      ${candidate}`);
+    const candidates = extractImageUrls(page.buf.toString('utf8'), page.finalUrl, httpsUrl).filter((c) => c !== httpsUrl);
+    for (let i = 0; i < candidates.length; i += 1) {
+      await save(`5-page-html-${i + 1}`, await attempt(candidates[i], inPageImageHeaders(page.finalUrl, candidates[i], page.jar)), candidates[i]);
+      console.log(`      ${candidates[i]}`);
     }
   }
+  const provider = providerOf(new URL(url).hostname);
+  const wb = await waybackDownload(url, provider);
+  await save(`6-wayback${wb.snapshot ? `-${wb.snapshot}` : ''}`, wb, url);
   await fs.writeFile(path.join(dir, 'probe.txt'), `${url}\n${lines.join('\n')}\n`);
-  console.log(`Saved to ${dir}. Open the image files and check which ones have no watermark.`);
+  console.log(`Saved to ${dir}.`);
 }
 
 // ---------- reports ----------
-// Labels written by the first version of this tool.
-const OLD_LABELS = {
-  'bai viet': 'posts', 'chu ky': 'signatures', tuong: 'wall messages',
-  'tin nhan': 'private messages', 'binh luan': 'post comments', 'thong bao': 'announcements',
-};
-
 const csvCell = (v) => {
   const s = v == null ? '' : String(v);
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
 async function writeIndex(out, all, manifest) {
-  const header = ['url', 'provider', 'host', 'status', 'origin', 'file', 'bytes', 'refs', 'used_in', 'wayback'];
+  const header = ['url', 'provider', 'host', 'status', 'quality', 'origin', 'file', 'bytes', 'refs', 'used_in', 'saved_from', 'wayback'];
   const rows = [header.join(',')];
   for (const item of all) {
     const rec = manifest.get(item.url) || {};
-    const origin = rec.status === 'ok' ? (String(rec.source || '').startsWith('wayback') ? 'wayback' : 'direct') : '';
-    const status = rec.status === 'suspect' ? 'suspected_placeholder' : (rec.status || 'pending');
+    const ok = rec.status === 'ok';
     rows.push([
-      item.url, item.provider || providerOf(item.host), item.host, status, origin,
-      (rec.file || '').split(path.sep).join('/'), rec.bytes || '', item.refs,
-      (item.usedIn || item.kinds || []).map((k) => OLD_LABELS[k] || k).join('; '), rec.wayback || '',
+      item.url,
+      item.provider,
+      item.host,
+      rec.status === 'suspect' ? 'suspected_placeholder' : (rec.status || 'pending'),
+      ok ? rec.quality || '' : '',
+      ok ? rec.origin || '' : '',
+      (rec.file || '').split(path.sep).join('/'),
+      rec.bytes || '',
+      item.refs,
+      (item.usedIn || []).join('; '),
+      rec.via || '',
+      rec.wayback || '',
     ].map(csvCell).join(','));
   }
   // BOM so Excel opens the file as UTF-8.
@@ -617,29 +574,31 @@ async function writeIndex(out, all, manifest) {
 
 function printSummary(all, manifest, out) {
   const byProvider = new Map();
+  const blank = () => ({ links: 0, saved: 0, original: 0, viewer: 0, wayback: 0, lost: 0, pending: 0, bytes: 0 });
   for (const item of all) {
-    const p = item.provider || providerOf(item.host);
-    const row = byProvider.get(p) || { links: 0, ok: 0, wayback: 0, dead: 0, pending: 0, bytes: 0 };
+    const row = byProvider.get(item.provider) || blank();
     const rec = manifest.get(item.url);
     row.links += 1;
     if (!rec || !rec.status) row.pending += 1;
     else if (rec.status === 'ok') {
-      row.ok += 1;
+      row.saved += 1;
       row.bytes += rec.bytes || 0;
-      if (String(rec.source || '').startsWith('wayback')) row.wayback += 1;
-    } else row.dead += 1;
-    byProvider.set(p, row);
+      if (rec.quality === 'viewer') row.viewer += 1;
+      else row.original += 1;
+      if (rec.origin === 'wayback') row.wayback += 1;
+    } else row.lost += 1;
+    byProvider.set(item.provider, row);
   }
-  const rows = [...byProvider.entries()].sort((a, b) => b[1].links - a[1].links);
-  console.log('\nProvider        links      saved  (wayback) not saved   pending        MB');
-  let total = { links: 0, ok: 0, wayback: 0, dead: 0, pending: 0, bytes: 0 };
-  for (const [p, r] of rows) {
-    console.log(`${p.padEnd(14)}${String(r.links).padStart(7)}${String(r.ok).padStart(11)}${String(r.wayback).padStart(11)}`
-      + `${String(r.dead).padStart(10)}${String(r.pending).padStart(10)}${(r.bytes / 1048576).toFixed(1).padStart(10)}`);
+  const cols = [['links', 7], ['saved', 8], ['original', 10], ['viewer', 8], ['wayback', 9], ['lost', 8], ['pending', 9]];
+  const line = (name, r) => `${name.padEnd(13)}${cols.map(([k, w]) => String(r[k]).padStart(w)).join('')}${(r.bytes / 1048576).toFixed(1).padStart(10)}`;
+  console.log(`\n${'provider'.padEnd(13)}${cols.map(([k, w]) => k.padStart(w)).join('')}${'MB'.padStart(10)}`);
+  const total = blank();
+  for (const [p, r] of [...byProvider.entries()].sort((a, b) => b[1].links - a[1].links)) {
+    console.log(line(p, r));
     for (const k of Object.keys(total)) total[k] += r[k];
   }
-  console.log(`${'TOTAL'.padEnd(14)}${String(total.links).padStart(7)}${String(total.ok).padStart(11)}${String(total.wayback).padStart(11)}`
-    + `${String(total.dead).padStart(10)}${String(total.pending).padStart(10)}${(total.bytes / 1048576).toFixed(1).padStart(10)}`);
+  console.log(line('TOTAL', total));
+  console.log('original = file as served by the host or an early Wayback capture; viewer = Photobucket copy without watermark (may be reduced).');
   console.log(`Images: ${path.join(out, IMAGES_DIR)}   List: ${path.join(out, 'index.csv')}`);
 }
 
@@ -676,35 +635,23 @@ async function main() {
   }
 
   const manifest = await readManifest(manifestFile);
-  await migrateLayout(out, manifest, manifestFile);
-
-  let list = all;
-  if (opts.provider) list = list.filter((u) => u.provider === opts.provider);
-  if (opts.host) list = list.filter((u) => u.host.includes(opts.host));
-  if (opts.refetch) {
-    // Saved images whose last download used a different request style than the one chosen now.
+  let list = opts.provider ? all.filter((u) => u.provider === opts.provider) : all;
+  if (opts.wayback) {
+    // Dead links, and Photobucket "viewer" copies that may have an original capture.
     list = list.filter((u) => {
       const rec = manifest.get(u.url);
-      const wanted = profileFor(u.provider, opts.profile);
-      return rec?.status === 'ok' && !String(rec.source || '').startsWith('wayback') && (rec.profile || 'image') !== wanted;
-    });
-  } else if (opts.wayback) {
-    list = list.filter((u) => {
-      const rec = manifest.get(u.url);
-      return rec && rec.status && rec.status !== 'ok' && rec.status !== 'suspect' && !rec.waybackTried;
+      if (!rec?.status || rec.waybackTried) return false;
+      if (rec.status === 'ok') return rec.quality === 'viewer';
+      return rec.status !== 'suspect';
     });
   } else {
-    list = list.filter((u) => {
-      const rec = manifest.get(u.url);
-      return !FINAL.has(rec?.status) && !rec?.waybackTried;
-    });
+    list = list.filter((u) => !manifest.get(u.url)?.status);
   }
   if (opts.sample > 0 && list.length > opts.sample) {
     const step = list.length / opts.sample;
     list = Array.from({ length: opts.sample }, (_, i) => list[Math.floor(i * step)]);
   }
-  const mode = opts.refetch ? ' again (refetch)' : opts.wayback ? ' through the Wayback Machine' : '';
-  console.log(`Processing ${list.length} links${mode}...`);
+  console.log(`Processing ${list.length} links${opts.wayback ? ' through the Wayback Machine' : ''}...`);
 
   const counts = {};
   let done = 0;
@@ -715,54 +662,47 @@ async function main() {
     while (index < list.length) {
       const item = list[index];
       index += 1;
-      const profile = profileFor(item.provider, opts.profile);
       const previous = manifest.get(item.url) || {};
-      const result = opts.wayback ? await waybackDownload(item.url) : await tryDownload(item.url, profile);
       const rec = { url: item.url, at: new Date().toISOString() };
+      let label;
       if (opts.wayback) {
+        const result = await waybackDownload(item.url, item.provider);
         rec.waybackTried = true;
-        if (result.status === 'ok') rec.status = 'ok';
-        else rec.wayback = result.status;
-      } else if (opts.refetch) {
-        // Never lose a saved image: on failure keep the old file and record why.
-        if (result.status === 'ok') rec.status = 'ok';
-        else rec.refetchFailed = result.status;
-      } else {
-        rec.status = result.status;
-      }
-      if (result.finalUrl && result.finalUrl !== item.url) rec.finalUrl = result.finalUrl;
-      if (result.detail) rec.detail = result.detail;
-      if (result.status === 'ok') {
-        const file = localPath(out, item.url, result.ext);
-        await fs.mkdir(path.dirname(file), { recursive: true });
-        await fs.writeFile(file, result.buf);
-        const relative = path.relative(out, file);
-        if (opts.refetch && previous.file && previous.file !== relative) {
-          await fs.rm(path.join(out, previous.file), { force: true });
+        if (result.status === 'ok') {
+          Object.assign(rec, await saveImage(out, item.url, result, previous.file), {
+            status: 'ok', quality: 'original', origin: 'wayback', snapshot: result.snapshot,
+          });
+          label = previous.status === 'ok' ? 'upgraded' : 'recovered';
+        } else {
+          rec.wayback = result.status;
+          label = result.status;
         }
-        Object.assign(rec, {
-          file: relative,
-          ext: result.ext,
-          bytes: result.buf.length,
-          sha256: crypto.createHash('sha256').update(result.buf).digest('hex'),
-          source: opts.wayback ? `wayback ${result.snapshot}` : 'direct',
-          profile: opts.wayback ? 'image' : profile,
-        });
+        await sleep(800);
+      } else {
+        const result = await bestDownload(item);
+        rec.status = result.status;
+        rec.strategy = result.strategy;
+        if (result.detail) rec.detail = result.detail;
+        if (result.status === 'ok') {
+          Object.assign(rec, await saveImage(out, item.url, result, null), {
+            quality: result.strategy === 'page-referer' ? 'viewer' : 'original',
+            origin: 'direct',
+          });
+          if (result.via) rec.via = result.via;
+        }
+        label = result.status;
       }
-      manifest.set(item.url, { ...(manifest.get(item.url) || {}), ...rec });
+      manifest.set(item.url, { ...previous, ...rec });
       await fs.appendFile(manifestFile, `${JSON.stringify(rec)}\n`);
-      const label = opts.refetch ? (rec.status === 'ok' ? 'replaced' : `kept_old (${rec.refetchFailed})`) : (rec.status || rec.wayback);
       counts[label] = (counts[label] || 0) + 1;
       done += 1;
       if (done % 25 === 0 || done === list.length) {
-        const summary = Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(', ');
-        process.stdout.write(`\r${done}/${list.length}: ${summary}        `);
+        process.stdout.write(`\r${done}/${list.length}: ${Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(', ')}        `);
       }
       if (Date.now() - lastSave > 60000) {
         lastSave = Date.now();
         await writeIndex(out, all, manifest);
       }
-      if (opts.wayback) await sleep(800);
     }
   };
   await Promise.all(Array.from({ length: concurrency }, worker));
