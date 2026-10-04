@@ -422,7 +422,11 @@ function localPath(out, url, ext) {
   let name = parts.pop();
   const hash = crypto.createHash('sha1').update(url).digest('hex').slice(0, 8);
   if (u.search) name = `${name}__${hash}`;
-  if (!new RegExp(`\\.(${ext}|jpe?g)$`, 'i').test(name)) name = `${name}.${ext}`;
+  // The extension must match the real format (Photobucket may send WebP for a .jpg link).
+  const current = /\.(jpe?g|jpe|png|gif|webp|bmp)$/i.exec(name);
+  const same = current && (current[1].toLowerCase() === ext || (ext === 'jpg' && /^jpe?g|jpe$/i.test(current[1])));
+  if (current && !same) name = `${name.slice(0, -current[0].length)}.${ext}`;
+  else if (!current) name = `${name}.${ext}`;
   let full = path.join(out, IMAGES_DIR, provider, host, ...parts, name);
   if (full.length > 230) full = path.join(out, IMAGES_DIR, provider, '_long-paths', `${hash}.${ext}`);
   return full;
