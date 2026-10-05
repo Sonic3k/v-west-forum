@@ -27,6 +27,14 @@ node tools/import-assets.js "E:\FC Westlife\4rum VW\forum\forum"
 node tools/rescue-images.js --out "E:\FC Westlife\external-images"
 node tools/rescue-images.js --out "E:\FC Westlife\external-images" --wayback
 
-# Publish the rescued images to MySQL; the panel then shows them instead of dead links (re-run after each rescue pass)
-node tools/publish-images.js --out "E:\FC Westlife\external-images"
+# Publish the rescued images; the panel then shows them instead of dead links (re-run after each rescue pass).
+# B2 (same bucket as sonic-hub, folder v-west-forum/external/, served by the CDN):
+$env:B2_KEY_ID = "<key id>"; $env:B2_APP_KEY = "<application key>"
+node tools/publish-images.js --out "E:\FC Westlife\external-images" --target b2
+# or keep the image bytes in MySQL instead:
+node tools/publish-images.js --out "E:\FC Westlife\external-images" --target mysql
 ```
+
+B2 defaults (override with environment variables): `B2_ENDPOINT=s3.us-east-005.backblazeb2.com`, `B2_REGION=us-east-005`,
+`B2_BUCKET=sonic-hub`, `B2_PREFIX=v-west-forum`, `CDN_BASE=https://sonic-hub.b-cdn.net`.
+The panel itself needs no B2 settings: it redirects to the CDN address stored with each image.

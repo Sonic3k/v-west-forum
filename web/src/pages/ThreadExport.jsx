@@ -53,7 +53,8 @@ async function buildStandaloneHtml(node, title) {
       const src = img.getAttribute('src') || '';
       if (!src.startsWith('/api/')) return;
       try {
-        const res = await fetch(src);
+        // Rescued images may live on the CDN: ask the panel to pass the bytes through (no CORS issue).
+        const res = await fetch(src.startsWith('/api/external') ? `${src}&proxy=1` : src);
         if (!res.ok) throw new Error(String(res.status));
         img.setAttribute('src', await blobToDataUrl(await res.blob()));
         img.removeAttribute('loading');
