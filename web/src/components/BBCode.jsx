@@ -74,6 +74,28 @@ function RemoteImage({ src, alt = '' }) {
   );
 }
 
+// External [IMG]: the rescued copy saved by the panel first, then the original link, then a note.
+function ExternalImage({ src }) {
+  const [stage, setStage] = useState(0);
+  if (stage >= 2) {
+    return (
+      <a className="bb-broken" href={src} target="_blank" rel="noopener noreferrer nofollow">
+        Ảnh không còn tải được
+      </a>
+    );
+  }
+  return (
+    <img
+      className="bb-img"
+      src={stage === 0 ? `/api/external?u=${encodeURIComponent(src)}` : src}
+      alt=""
+      loading="lazy"
+      referrerPolicy="no-referrer"
+      onError={() => setStage(stage + 1)}
+    />
+  );
+}
+
 function InlineAttachment({ id, attachments }) {
   const a = attachments?.get(id);
   const url = `/api/attachments/${id}`;
@@ -162,7 +184,7 @@ function renderNode(node, ctx, key) {
       const src = safeUrl(node.raw);
       const local = src ? internalImage(src) : null;
       if (local) return <RemoteImage key={key} src={local} />;
-      return src && /^https?:/i.test(src) ? <RemoteImage key={key} src={src} /> : renderText(node.raw, key);
+      return src && /^https?:/i.test(src) ? <ExternalImage key={key} src={src} /> : renderText(node.raw, key);
     }
     case 'quote': return <Quote key={key} opt={node.opt}>{kids()}</Quote>;
     case 'code':

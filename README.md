@@ -10,7 +10,7 @@ Node (Express) + React (Vite), deployed on Railway with the `Dockerfile`. The UI
 
 Database connection check: open `/api/health/db`.
 
-The panel only adds its own tables (`panel_post_search`, `panel_meta`, `panel_asset`); vBulletin tables are never modified.
+The panel only adds its own tables (`panel_post_search`, `panel_meta`, `panel_asset`, `panel_external_image`, `panel_external_blob`); vBulletin tables are never modified.
 
 ## Tools (run locally, PowerShell, inside `server/`)
 
@@ -26,4 +26,7 @@ node tools/import-assets.js "E:\FC Westlife\4rum VW\forum\forum"
 # Rescue hotlinked images (Photobucket, ...) into a local folder grouped by provider
 node tools/rescue-images.js --out "E:\FC Westlife\external-images"
 node tools/rescue-images.js --out "E:\FC Westlife\external-images" --wayback
+
+# Publish the rescued images to MySQL; the panel then shows them instead of dead links (re-run after each rescue pass)
+node tools/publish-images.js --out "E:\FC Westlife\external-images"
 ```

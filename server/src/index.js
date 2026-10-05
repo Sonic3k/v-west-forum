@@ -9,6 +9,7 @@ import { attachmentsRouter } from './routes/attachments.js';
 import { usersRouter } from './routes/users.js';
 import { searchRouter } from './routes/search.js';
 import { assetsRouter, avatarsRouter, smiliesRouter } from './routes/assets.js';
+import { externalRouter } from './routes/external.js';
 import { startSearchIndex } from './searchIndex.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -44,6 +45,7 @@ app.use('/api/search', searchRouter);
 app.use('/api/assets', assetsRouter);
 app.use('/api/avatars', avatarsRouter);
 app.use('/api/smilies', smiliesRouter);
+app.use('/api/external', externalRouter);
 app.use('/api', (req, res) => res.status(404).json({ error: 'Không có API này.' }));
 
 app.use('/assets', express.static(path.join(webDist, 'assets'), { immutable: true, maxAge: '1y' }));
