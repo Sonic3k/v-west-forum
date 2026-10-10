@@ -66,6 +66,8 @@ async function readManifest(file) {
 }
 
 const sha1 = (s) => crypto.createHash('sha1').update(s, 'utf8').digest('hex');
+// Paths in the manifest use the separator of the computer that wrote them (\ on Windows).
+const fromRel = (out, rel) => path.join(out, ...String(rel).split(/[\\/]/));
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 
 function chunks(list, size) {
@@ -192,7 +194,7 @@ async function main() {
   const rows = [];
   let missingFiles = 0;
   for (const rec of saved) {
-    const file = path.join(out, rec.file);
+    const file = fromRel(out, rec.file);
     if (!existsSync(file)) {
       missingFiles += 1;
       continue;
@@ -204,7 +206,7 @@ async function main() {
     rows.push({
       urlHash, url: rec.url, provider: info.provider || providerOf(host), host,
       quality: rec.quality || 'original', origin: rec.origin || 'direct', snapshot: rec.snapshot || null,
-      sha256: rec.sha256, file, localFile: rec.file.split(path.sep).join('/'), refs: info.refs || 0,
+      sha256: rec.sha256, file, localFile: rec.file.split(/[\\/]/).join('/'), refs: info.refs || 0,
       mime: MIME[rec.ext] || 'application/octet-stream',
       storageKey: key, publicUrl: key ? publicUrlFor(key) : null,
       previousKey: inDb.get(urlHash)?.storage_key || null,
@@ -223,7 +225,16 @@ async function main() {
     await runPool(todo, B2.concurrency, async (r) => {
       try {
         const data = await fs.readFile(r.file);
-        await b2.put(r.storageKey, data, r.mime);
+        for (let attempt = 1; ; attempt += 1) {
+          try {
+            await b2.put(r.storageKey, data, r.mime);
+            break;
+          } catch (err) {
+            // Dropped connections and timeouts happen on long uploads: wait and try again (3 tries).
+            if (attempt >= 3 || /AccessDenied|Forbidden|InvalidAccessKey|SignatureDoesNotMatch/i.test(`${err.name} ${err.message}`)) throw err;
+            await new Promise((resolve) => { setTimeout(resolve, attempt * 5000); });
+          }
+        }
         bytes += data.length;
         if (r.previousKey && r.previousKey !== r.storageKey) await b2.remove(r.previousKey).catch(() => {});
       } catch (err) {
@@ -302,15 +313,15 @@ async function main() {
   );
 
   const [byProvider] = await db.query(
-    `SELECT provider, quality, IF(storage_key IS NULL, 'mysql', 'b2') AS stored, COUNT(*) AS links
-       FROM panel_external_image GROUP BY provider, quality, stored ORDER BY links DESC`,
+    `SELECT provider, quality, IF(storage_key IS NULL, 'mysql', 'b2') AS storage, COUNT(*) AS links
+       FROM panel_external_image GROUP BY provider, quality, storage ORDER BY links DESC`,
   );
   const [[blobs]] = await db.query('SELECT COUNT(*) AS n, COALESCE(SUM(bytes), 0) AS bytes FROM panel_external_blob');
   await db.end();
 
   console.log(`Links published: ${publish.length} (removed ${stale.length} stale; ${orphans.affectedRows || 0} image blobs removed from MySQL).`);
   if (Number(blobs.n)) console.log(`Image bytes still in MySQL: ${blobs.n} files, ${(Number(blobs.bytes) / 1048576).toFixed(1)} MB.`);
-  for (const r of byProvider) console.log(`  ${String(r.provider).padEnd(13)} ${String(r.quality).padEnd(9)} ${String(r.stored).padEnd(6)} ${r.links}`);
+  for (const r of byProvider) console.log(`  ${String(r.provider).padEnd(13)} ${String(r.quality).padEnd(9)} ${String(r.storage).padEnd(6)} ${r.links}`);
   console.log('The panel picks up the changes within 5 minutes.');
 }
 

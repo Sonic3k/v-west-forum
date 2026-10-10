@@ -632,6 +632,9 @@ function localPath(out, url, ext) {
   return full;
 }
 
+// Paths in the manifest use the separator of the computer that wrote them (\ on Windows).
+const fromRel = (out, rel) => path.join(out, ...String(rel).split(/[\\/]/));
+
 async function moveFile(from, to) {
   await fs.mkdir(path.dirname(to), { recursive: true });
   try {
@@ -647,7 +650,7 @@ async function saveImage(out, url, result, previousFile) {
   await fs.mkdir(path.dirname(file), { recursive: true });
   await fs.writeFile(file, result.buf);
   const relative = path.relative(out, file);
-  if (previousFile && previousFile !== relative) await fs.rm(path.join(out, previousFile), { force: true });
+  if (previousFile && previousFile !== relative) await fs.rm(fromRel(out, previousFile), { force: true });
   return {
     file: relative,
     ext: result.ext,
@@ -694,14 +697,14 @@ async function markSuspects(out, manifest, manifestFile) {
     let quarantined = 0;
     for (const rec of list) {
       const at = new Date().toISOString();
-      const src = rec.file ? path.join(out, rec.file) : null;
+      const src = rec.file ? fromRel(out, rec.file) : null;
       if (!existsSync(keep) && src && existsSync(src)) {
         await fs.mkdir(path.dirname(keep), { recursive: true });
         await fs.copyFile(src, keep);
       }
-      if (rec.prev?.file && existsSync(path.join(out, rec.prev.file))) {
-        if (src && rec.file !== rec.prev.origFile) await fs.rm(src, { force: true });
-        await moveFile(path.join(out, rec.prev.file), path.join(out, rec.prev.origFile));
+      if (rec.prev?.file && existsSync(fromRel(out, rec.prev.file))) {
+        if (src && fromRel(out, rec.file) !== fromRel(out, rec.prev.origFile)) await fs.rm(src, { force: true });
+        await moveFile(fromRel(out, rec.prev.file), fromRel(out, rec.prev.origFile));
         const next = {
           url: rec.url, status: 'ok', file: rec.prev.origFile, ext: rec.prev.ext, bytes: rec.prev.bytes,
           sha256: rec.prev.sha256, quality: rec.prev.quality, origin: rec.prev.origin, snapshot: null,
@@ -800,14 +803,14 @@ async function writeIndex(out, all, manifest) {
       rec.status === 'suspect' ? 'suspected_placeholder' : (rec.status || 'pending'),
       ok ? rec.quality || '' : '',
       ok ? rec.origin || '' : '',
-      (rec.file || '').split(path.sep).join('/'),
+      (rec.file || '').split(/[\\/]/).join('/'),
       rec.bytes || '',
       item.refs,
       (item.usedIn || []).join('; '),
       rec.via || '',
       rec.wbResult || (rec.wbIndexed ? (rec.wbTs ? 'archived' : 'not_archived') : ''),
       ok && rec.origin === 'wayback' ? rec.snapshot || '' : '',
-      (rec.prev?.file || '').split(path.sep).join('/'),
+      (rec.prev?.file || '').split(/[\\/]/).join('/'),
     ].map(csvCell).join(','));
   }
   // BOM so Excel opens the file as UTF-8.
@@ -968,7 +971,7 @@ async function runWayback({ out, all, manifest, manifestFile, opts }) {
     const sha = crypto.createHash('sha256').update(result.buf).digest('hex');
     if (rec.status === 'ok' && rec.quality === 'viewer') {
       // Upgrade only when the archived copy is at least as large as the copy we have.
-      const oldPath = path.join(out, rec.file);
+      const oldPath = fromRel(out, rec.file);
       const oldBuf = existsSync(oldPath) ? await fs.readFile(oldPath) : null;
       const oldSize = imageSize(oldBuf);
       const newSize = imageSize(result.buf);
@@ -984,7 +987,7 @@ async function runWayback({ out, all, manifest, manifestFile, opts }) {
         return;
       }
       const supersededRel = path.join(SUPERSEDED_DIR, rec.file.replace(/^images[\\/]/, ''));
-      if (oldBuf) await moveFile(oldPath, path.join(out, supersededRel));
+      if (oldBuf) await moveFile(oldPath, fromRel(out, supersededRel));
       const saved = await saveImage(out, item.url, result, null);
       stats.upgraded += 1;
       await write({

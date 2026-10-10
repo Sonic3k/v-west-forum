@@ -62,8 +62,8 @@ function streamFrom(url, res, redirects = 0) {
 
 externalRouter.get('/stats', async (req, res) => {
   const rows = await q(
-    `SELECT provider, quality, origin, IF(storage_key IS NULL, 'mysql', 'b2') AS stored, COUNT(*) AS links
-       FROM panel_external_image GROUP BY provider, quality, origin, stored ORDER BY links DESC`,
+    `SELECT provider, quality, origin, IF(storage_key IS NULL, 'mysql', 'b2') AS storage, COUNT(*) AS links
+       FROM panel_external_image GROUP BY provider, quality, origin, storage ORDER BY links DESC`,
   ).catch(() => []);
   res.json({ rows });
 });
