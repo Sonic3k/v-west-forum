@@ -19,8 +19,9 @@
 //
 // The Wayback step is slow on purpose (the Internet Archive refuses clients that ask too fast): one lookup per
 // folder or small website lists every archived image there, archived files are downloaded at most 12 per minute,
-// and refusals (429, 5xx, dropped connections) are retried later instead of being recorded. Stop it any time;
-// the same command continues where it stopped.
+// and refusals (429, 5xx, dropped connections) are retried later instead of being recorded: it waits 1, 2, 4...
+// up to 30 minutes between tries and only gives up after 3 hours of refusals (the archive sometimes limits a whole
+// home connection for hours). Stop it any time; the same command continues where it stopped.
 // Options: --provider <name>   only one provider (photobucket, google, flickr, facebook, ...)
 //          --sample <n>        only try n links, spread evenly over the list (with --wayback: the n most used folders)
 //          --concurrency <n>   parallel downloads (default 4; the Wayback step always works one request at a time)
@@ -50,8 +51,8 @@ const WB = {
   cdxIntervalMs: Number(process.env.WAYBACK_CDX_INTERVAL_MS || 3000), // at most 20 lookups per minute
   fetchIntervalMs: Number(process.env.WAYBACK_FETCH_INTERVAL_MS || 5000), // at most 12 downloads per minute
   backoffMs: Number(process.env.WAYBACK_BACKOFF_MS || 60000), // first wait after a refusal, then doubled
-  backoffMaxMs: 15 * 60000,
-  maxRefusals: 6, // refusals in a row before the run stops (run again later)
+  backoffMaxMs: Number(process.env.WAYBACK_BACKOFF_MAX_MS || 30 * 60000), // longest wait between two tries
+  maxRefusedMs: Number(process.env.WAYBACK_MAX_REFUSED_MS || 3 * 3600000), // give up after this long refused
   maxForbidden: 5, // 403 answers in a row before the run stops
   hostMaxFolders: 20, // a website with 2..20 folders to check is looked up in one go
   hostPageRows: Number(process.env.WAYBACK_HOST_PAGE_ROWS || 10000),
@@ -494,24 +495,30 @@ async function paced(kind) {
 }
 
 let refusals = 0;
-// Run fn(); when the archive refuses, wait 1, 2, 4... minutes (max 15) and try again.
+let refusedSince = 0;
+// Run fn(); when the archive refuses, wait 1, 2, 4... minutes (max 30) and try again,
+// for up to 3 hours of refusals in a row.
 async function politely(kind, fn, onWait) {
   for (;;) {
     await paced(kind);
     try {
       const result = await fn();
       refusals = 0;
+      refusedSince = 0;
       return result;
     } catch (err) {
       if (!(err instanceof Refused)) throw err;
       refusals += 1;
-      if (refusals >= WB.maxRefusals) throw new StopRun(err.message);
+      if (!refusedSince) refusedSince = Date.now();
       const wait = Math.min(WB.backoffMaxMs, WB.backoffMs * 2 ** (refusals - 1));
+      if (Date.now() + wait - refusedSince > WB.maxRefusedMs) throw new StopRun(err.message);
       if (onWait) onWait(err.message, wait);
       await sleep(wait);
     }
   }
 }
+
+const formatWait = (ms) => (ms >= 120000 ? `${Math.round(ms / 60000)} min` : `${Math.round(ms / 1000)} s`);
 
 // One page of a CDX lookup: archived (status 200, not HTML) files, one row per address (earliest capture).
 async function cdxPage({ target, matchType, cutoff, limit, resumeKey }) {
@@ -769,7 +776,7 @@ async function probe(out, url) {
     }
   }
   const provider = providerOf(new URL(url).hostname);
-  const onWait = (why, ms) => console.log(`  (Internet Archive: ${why}; waiting ${Math.round(ms / 1000)} s)`);
+  const onWait = (why, ms) => console.log(`  (Internet Archive: ${why}; waiting ${formatWait(ms)})`);
   try {
     const group = { kind: 'exact', target: url, cutoff: provider === 'photobucket' ? PHOTOBUCKET_CDX_CUTOFF : null, keys: new Map([[matchKey(url), [url]]]) };
     const { captures } = await lookupGroup(group, onWait);
@@ -951,7 +958,10 @@ async function runWayback({ out, all, manifest, manifestFile, opts }) {
     `\rlookup ${gi}/${queue.length} | archived ${stats.archived} | recovered ${stats.recovered} | upgraded ${stats.upgraded}`
     + ` | not better ${stats.notBetter} | failed ${stats.failed}      `,
   );
-  const onWait = (why, ms) => process.stdout.write(`\nInternet Archive: ${why}. Waiting ${Math.round(ms / 1000)} s before trying again...\n`);
+  const onWait = (why, ms) => {
+    const at = new Date().toLocaleTimeString();
+    process.stdout.write(`\n[${at}] Internet Archive: ${why}. Waiting ${formatWait(ms)} before trying again...\n`);
+  };
 
   async function fetchOne(item) {
     const rec = manifest.get(item.url);
@@ -1049,7 +1059,8 @@ async function runWayback({ out, all, manifest, manifestFile, opts }) {
     console.log('');
   } catch (err) {
     if (!(err instanceof StopRun)) throw err;
-    console.log(`\nInternet Archive keeps refusing (${err.message}). Stopped for now; run the same command later to continue.`);
+    console.log(`\nInternet Archive has refused for a long time (${err.message}). Stopped for now; run the same command later`
+      + ' (or from another network, e.g. a phone hotspot) to continue.');
   }
 }
 
