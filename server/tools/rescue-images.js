@@ -811,8 +811,16 @@ async function writeIndex(out, all, manifest) {
     ].map(csvCell).join(','));
   }
   // BOM so Excel opens the file as UTF-8.
-  await fs.writeFile(path.join(out, 'index.csv'), `\uFEFF${rows.join('\r\n')}\r\n`, 'utf8');
+  try {
+    await fs.writeFile(path.join(out, 'index.csv'), `\uFEFF${rows.join('\r\n')}\r\n`, 'utf8');
+  } catch (err) {
+    // Excel locks a file it has open: keep working, the list is written again later.
+    if (!['EBUSY', 'EPERM', 'EACCES'].includes(err.code)) throw err;
+    if (!indexLockWarned) console.log('\n(index.csv is open in another program, e.g. Excel: it will be updated after you close it.)');
+    indexLockWarned = true;
+  }
 }
+let indexLockWarned = false;
 
 function printSummary(all, manifest, out) {
   const byProvider = new Map();
